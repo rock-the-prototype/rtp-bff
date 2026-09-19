@@ -45,3 +45,4 @@ flowchart LR
     BFF -->|"OIDC Authorization Code + PKCE"| Keycloak
     BFF --> Session
     BFF --> Profile
+```
