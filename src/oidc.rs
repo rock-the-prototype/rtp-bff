@@ -191,12 +191,6 @@ async fn callback(
     State(state): State<OidcState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode, StatusCode> {
-    if params.contains_key("error") {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let code = params.get("code").cloned().ok_or(StatusCode::BAD_REQUEST)?;
-
     let returned_state = params
         .get("state")
         .cloned()
@@ -214,6 +208,12 @@ async fn callback(
             .remove(&returned_state)
             .ok_or(StatusCode::BAD_REQUEST)?
     };
+
+    if params.contains_key("error") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let code = params.get("code").cloned().ok_or(StatusCode::BAD_REQUEST)?;
 
     let client_secret =
         env::var("RTP_OIDC_CLIENT_SECRET").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -382,4 +382,52 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
+}
+
+#[tokio::test]
+async fn oidc_error_callback_consumes_pending_transaction() {
+    let http_client = reqwest::ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("OIDC HTTP client must be constructible");
+
+    let state = OidcState {
+        http_client,
+        provider_metadata: Arc::new(AsyncMutex::new(None)),
+        pending: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let state_key = "test-state".to_owned();
+
+    let (_, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+
+    state
+        .pending
+        .lock()
+        .expect("pending login store must be lockable")
+        .insert(
+            state_key.clone(),
+            PendingLogin {
+                pkce_verifier,
+                nonce: Nonce::new_random(),
+                created_at: Instant::now(),
+                client_ip: IpAddr::from([127, 0, 0, 1]),
+            },
+        );
+
+    let params = HashMap::from([
+        ("error".to_owned(), "access_denied".to_owned()),
+        ("state".to_owned(), state_key.clone()),
+    ]);
+
+    let result = callback(State(state.clone()), Query(params)).await;
+
+    assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+
+    let pending = state
+        .pending
+        .lock()
+        .expect("pending login store must be lockable");
+
+    assert!(!pending.contains_key(&state_key));
 }
