@@ -1,42 +1,58 @@
 use std::{
     collections::HashMap,
     env,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::Redirect,
     routing::get,
 };
 
+use axum_governor::{GovernorConfigBuilder, GovernorLayer, Quota, extractor::PeerIp};
+
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken, IssuerUrl,
+    Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, SignatureVerificationError,
+    TokenResponse,
     core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
     reqwest,
 };
 
+use tokio::sync::Mutex as AsyncMutex;
+
 const ISSUER: &str = "https://id.rock-the-prototype.com/realms/RTP";
 const CLIENT_ID: &str = "rtp-web";
-const REDIRECT_URI: &str = "http://127.0.0.1:3000/auth/callback";
+
+const REDIRECT_URI_ENV: &str = "RTP_OIDC_REDIRECT_URI";
+const LOCAL_REDIRECT_URI: &str = "http://127.0.0.1:3000/auth/callback";
 
 const LOGIN_TTL: Duration = Duration::from_secs(300);
-const MAX_PENDING_LOGINS: usize = 128;
 
-#[derive(Clone)]
-struct OidcState {
-    http_client: reqwest::Client,
-    pending: Arc<Mutex<HashMap<String, PendingLogin>>>,
-}
+const MAX_PENDING_LOGINS: usize = 128;
+const MAX_PENDING_LOGINS_PER_CLIENT: usize = 8;
+
+const LOGIN_REQUESTS_PER_MINUTE: u32 = 10;
+const LOGIN_BURST: u32 = 4;
 
 struct PendingLogin {
     pkce_verifier: PkceCodeVerifier,
     nonce: Nonce,
     created_at: Instant,
+    client_ip: IpAddr,
+}
+
+#[derive(Clone)]
+struct OidcState {
+    http_client: reqwest::Client,
+    provider_metadata: Arc<AsyncMutex<Option<CoreProviderMetadata>>>,
+    pending: Arc<Mutex<HashMap<String, PendingLogin>>>,
 }
 
 pub fn router() -> Router {
@@ -45,33 +61,79 @@ pub fn router() -> Router {
         .build()
         .expect("OIDC HTTP client must be constructible");
 
+    let login_requests_per_minute = NonZeroU32::new(LOGIN_REQUESTS_PER_MINUTE)
+        .expect("login requests per minute must be non-zero");
+
+    let login_burst = NonZeroU32::new(LOGIN_BURST).expect("login burst must be non-zero");
+
+    let login_rate_limit = GovernorConfigBuilder::default()
+        .with_extractor(PeerIp::default())
+        .expect_connect_info()
+        .quota_default(Quota::requests_per_minute(login_requests_per_minute).burst(login_burst))
+        .finish()
+        .expect("login rate-limit configuration must be valid");
+
     let state = OidcState {
         http_client,
+        provider_metadata: Arc::new(AsyncMutex::new(None)),
         pending: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    Router::new()
+    let login_router = Router::new()
         .route("/auth/login", get(login))
+        .layer(GovernorLayer::new(login_rate_limit));
+
+    Router::new()
+        .merge(login_router)
         .route("/auth/callback", get(callback))
         .with_state(state)
 }
 
-async fn login(State(state): State<OidcState>) -> Result<Redirect, StatusCode> {
+async fn provider_metadata(state: &OidcState) -> Result<CoreProviderMetadata, StatusCode> {
+    let mut cached = state.provider_metadata.lock().await;
+
+    if let Some(metadata) = cached.as_ref() {
+        return Ok(metadata.clone());
+    }
+
     let issuer =
         IssuerUrl::new(ISSUER.to_owned()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let provider_metadata = CoreProviderMetadata::discover_async(issuer, &state.http_client)
+    let metadata = CoreProviderMetadata::discover_async(issuer, &state.http_client)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    *cached = Some(metadata.clone());
+
+    Ok(metadata)
+}
+
+async fn refresh_provider_metadata(state: &OidcState) -> Result<CoreProviderMetadata, StatusCode> {
+    let issuer =
+        IssuerUrl::new(ISSUER.to_owned()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let metadata = CoreProviderMetadata::discover_async(issuer, &state.http_client)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let mut cached = state.provider_metadata.lock().await;
+    *cached = Some(metadata.clone());
+
+    Ok(metadata)
+}
+
+async fn login(
+    State(state): State<OidcState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Redirect, StatusCode> {
+    let provider_metadata = provider_metadata(&state).await?;
 
     let client = CoreClient::from_provider_metadata(
         provider_metadata,
         ClientId::new(CLIENT_ID.to_owned()),
         None,
     )
-    .set_redirect_uri(
-        RedirectUrl::new(REDIRECT_URI.to_owned()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-    );
+    .set_redirect_uri(redirect_uri()?);
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -96,6 +158,17 @@ async fn login(State(state): State<OidcState>) -> Result<Redirect, StatusCode> {
 
         pending.retain(|_, login| login.created_at.elapsed() < LOGIN_TTL);
 
+        let client_ip = peer.ip();
+
+        let pending_for_client = pending
+            .values()
+            .filter(|login| login.client_ip == client_ip)
+            .count();
+
+        if pending_for_client >= MAX_PENDING_LOGINS_PER_CLIENT {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+
         if pending.len() >= MAX_PENDING_LOGINS {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
@@ -106,6 +179,7 @@ async fn login(State(state): State<OidcState>) -> Result<Redirect, StatusCode> {
                 pkce_verifier,
                 nonce,
                 created_at: Instant::now(),
+                client_ip,
             },
         );
     }
@@ -144,21 +218,14 @@ async fn callback(
     let client_secret =
         env::var("RTP_OIDC_CLIENT_SECRET").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let issuer =
-        IssuerUrl::new(ISSUER.to_owned()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let provider_metadata = CoreProviderMetadata::discover_async(issuer, &state.http_client)
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let provider_metadata = provider_metadata(&state).await?;
 
     let client = CoreClient::from_provider_metadata(
         provider_metadata,
         ClientId::new(CLIENT_ID.to_owned()),
-        Some(ClientSecret::new(client_secret)),
+        Some(ClientSecret::new(client_secret.clone())),
     )
-    .set_redirect_uri(
-        RedirectUrl::new(REDIRECT_URI.to_owned()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-    );
+    .set_redirect_uri(redirect_uri()?);
 
     let token_response = client
         .exchange_code(AuthorizationCode::new(code))
@@ -172,9 +239,147 @@ async fn callback(
 
     let id_token_verifier = client.id_token_verifier();
 
-    id_token
-        .claims(&id_token_verifier, &pending_login.nonce)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    match id_token.claims(&id_token_verifier, &pending_login.nonce) {
+        Ok(_) => {}
+
+        Err(ClaimsVerificationError::SignatureVerification(
+            SignatureVerificationError::NoMatchingKey,
+        )) => {
+            let refreshed_metadata = refresh_provider_metadata(&state).await?;
+
+            let refreshed_client = CoreClient::from_provider_metadata(
+                refreshed_metadata,
+                ClientId::new(CLIENT_ID.to_owned()),
+                Some(ClientSecret::new(client_secret)),
+            )
+            .set_redirect_uri(redirect_uri()?);
+
+            let refreshed_verifier = refreshed_client.id_token_verifier();
+
+            id_token
+                .claims(&refreshed_verifier, &pending_login.nonce)
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        }
+
+        Err(_) => {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn redirect_uri() -> Result<RedirectUrl, StatusCode> {
+    let raw = env::var(REDIRECT_URI_ENV).unwrap_or_else(|_| LOCAL_REDIRECT_URI.to_owned());
+
+    validate_redirect_uri(raw)
+}
+
+fn validate_redirect_uri(raw: String) -> Result<RedirectUrl, StatusCode> {
+    let redirect = RedirectUrl::new(raw).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let url = redirect.url();
+
+    let is_loopback = matches!(
+        url.host_str(),
+        Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
+    );
+
+    if url.scheme() != "https" && !is_loopback {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok(redirect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::{Extension, body::Body, http::Request, routing::get};
+    use tower::ServiceExt;
+
+    #[test]
+    fn local_ipv4_http_redirect_is_allowed() {
+        let result = validate_redirect_uri("http://127.0.0.1:3000/auth/callback".to_owned());
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn localhost_http_redirect_is_allowed() {
+        let result = validate_redirect_uri("http://localhost:3000/auth/callback".to_owned());
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn non_loopback_https_redirect_is_allowed() {
+        let result = validate_redirect_uri("https://example.test/auth/callback".to_owned());
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn non_loopback_http_redirect_is_rejected() {
+        let result = validate_redirect_uri("http://example.test/auth/callback".to_owned());
+
+        assert_eq!(result, Err(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn malformed_redirect_uri_is_rejected() {
+        let result = validate_redirect_uri("not a valid URI".to_owned());
+
+        assert_eq!(result, Err(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[tokio::test]
+    async fn login_rate_limit_rejects_after_burst() {
+        let requests_per_minute = NonZeroU32::new(LOGIN_REQUESTS_PER_MINUTE)
+            .expect("login requests per minute must be non-zero");
+
+        let burst = NonZeroU32::new(LOGIN_BURST).expect("login burst must be non-zero");
+
+        let rate_limit = GovernorConfigBuilder::default()
+            .with_extractor(PeerIp::default())
+            .expect_connect_info()
+            .quota_default(Quota::requests_per_minute(requests_per_minute).burst(burst))
+            .finish()
+            .expect("login rate-limit configuration must be valid");
+
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(GovernorLayer::new(rate_limit))
+            .layer(Extension(ConnectInfo(peer)));
+
+        for _ in 0..LOGIN_BURST {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .body(Body::empty())
+                        .expect("request must be constructible"),
+                )
+                .await
+                .expect("rate-limit test request must succeed");
+
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request must be constructible"),
+            )
+            .await
+            .expect("rate-limit test request must succeed");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }

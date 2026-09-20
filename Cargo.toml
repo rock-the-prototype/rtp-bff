@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 axum = "=0.8.9"
+axum-governor = { version = "=2.1.0", default-features = false, features = ["dashmap"] }
 openidconnect = { version = "=4.0.1", features = ["timing-resistant-secret-traits"] }
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "net", "sync"] }
 
 [dev-dependencies]
 tower = { version = "=0.5.3", features = ["util"] }

@@ -46,7 +46,7 @@ flowchart LR
     BFF --> Session
     BFF --> Profile
 ```
-Than:
+Then:
 
 ```mermaid
 sequenceDiagram
