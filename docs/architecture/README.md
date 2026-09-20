@@ -32,7 +32,7 @@ This is a development-time binding only and is not a statement about the
 production network topology.
 
 ## Target logical architecture
-
+Initially:
 ```mermaid
 flowchart LR
     Browser["Browser / RTP Web"]
@@ -45,4 +45,23 @@ flowchart LR
     BFF -->|"OIDC Authorization Code + PKCE"| Keycloak
     BFF --> Session
     BFF --> Profile
+```
+Than:
+
+```mermaid
+sequenceDiagram
+participant Browser
+participant BFF as rtp-bff
+participant KC as Keycloak
+
+    Browser->>BFF: GET /auth/login
+    BFF-->>Browser: Redirect to authorization endpoint
+    Browser->>KC: Authorization request
+    KC-->>Browser: Redirect with code + state
+    Browser->>BFF: GET /auth/callback
+    BFF->>KC: Code + PKCE + client authentication
+    KC-->>BFF: ID / access / refresh tokens
+    BFF-->>Browser: Application response
+
+    Note over BFF,KC: Tokens remain server-side
 ```

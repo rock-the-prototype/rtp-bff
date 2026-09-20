@@ -42,6 +42,21 @@ Keycloak remains responsible for IAM capabilities.
 RTP-specific onboarding and persona state remains in the RTP application
 domain.
 
+### OIDC front-channel interaction
+
+The browser participates in the OIDC front channel.
+
+During authentication, `rtp-bff` redirects the browser to the Keycloak
+authorization endpoint. After authentication, Keycloak redirects the
+browser back to the BFF callback carrying the authorization code and
+state.
+
+This browser-to-Keycloak interaction is intentional and part of the
+Authorization Code Flow.
+
+OAuth access tokens, refresh tokens, client credentials and token endpoint
+interactions remain exclusively server-side in `rtp-bff`.
+
 ## Rationale
 
 ### Reduce token exposure
