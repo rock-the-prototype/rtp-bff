@@ -40,6 +40,8 @@ const MAX_PENDING_LOGINS_PER_CLIENT: usize = 8;
 
 const LOGIN_REQUESTS_PER_MINUTE: u32 = 10;
 const LOGIN_BURST: u32 = 4;
+const OIDC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct PendingLogin {
     pkce_verifier: PkceCodeVerifier,
@@ -58,6 +60,8 @@ struct OidcState {
 pub fn router() -> Router {
     let http_client = reqwest::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(OIDC_CONNECT_TIMEOUT)
+        .timeout(OIDC_REQUEST_TIMEOUT)
         .build()
         .expect("OIDC HTTP client must be constructible");
 
