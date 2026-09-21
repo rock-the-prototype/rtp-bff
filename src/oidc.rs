@@ -289,7 +289,10 @@ fn validate_redirect_uri(raw: String) -> Result<RedirectUrl, StatusCode> {
         Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
     );
 
-    if url.scheme() != "https" && !is_loopback {
+    let is_https = url.scheme() == "https";
+    let is_loopback_http = url.scheme() == "http" && is_loopback;
+
+    if !is_https && !is_loopback_http {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -327,6 +330,13 @@ mod tests {
     #[test]
     fn non_loopback_http_redirect_is_rejected() {
         let result = validate_redirect_uri("http://example.test/auth/callback".to_owned());
+
+        assert_eq!(result, Err(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn non_http_loopback_redirect_is_rejected() {
+        let result = validate_redirect_uri("ftp://localhost/auth/callback".to_owned());
 
         assert_eq!(result, Err(StatusCode::INTERNAL_SERVER_ERROR));
     }
