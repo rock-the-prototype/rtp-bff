@@ -14,9 +14,8 @@ use axum::{
     response::Redirect,
     routing::get,
 };
-
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use axum_governor::{GovernorConfigBuilder, GovernorLayer, Quota, extractor::PeerIp};
-
 use openidconnect::{
     AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken, IssuerUrl,
     Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, SignatureVerificationError,
@@ -24,7 +23,7 @@ use openidconnect::{
     core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
     reqwest,
 };
-
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
 const ISSUER: &str = "https://id.rock-the-prototype.com/realms/RTP";
@@ -40,12 +39,17 @@ const MAX_PENDING_LOGINS_PER_CLIENT: usize = 8;
 
 const LOGIN_REQUESTS_PER_MINUTE: u32 = 10;
 const LOGIN_BURST: u32 = 4;
+
 const OIDC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-struct PendingLogin {
+const PREAUTH_COOKIE_NAME: &str = "rtp-preauth";
+const BROWSER_BINDING_BYTES: u32 = 32;
+
+struct AuthorizationTransaction {
     pkce_verifier: PkceCodeVerifier,
     nonce: Nonce,
+    browser_binding_hash: [u8; 32],
     created_at: Instant,
     client_ip: IpAddr,
 }
@@ -54,7 +58,11 @@ struct PendingLogin {
 struct OidcState {
     http_client: reqwest::Client,
     provider_metadata: Arc<AsyncMutex<Option<CoreProviderMetadata>>>,
-    pending: Arc<Mutex<HashMap<String, PendingLogin>>>,
+    pending: Arc<Mutex<HashMap<String, AuthorizationTransaction>>>,
+}
+
+fn hash_browser_binding(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
 }
 
 pub fn router() -> Router {
@@ -129,17 +137,23 @@ async fn refresh_provider_metadata(state: &OidcState) -> Result<CoreProviderMeta
 async fn login(
     State(state): State<OidcState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Result<Redirect, StatusCode> {
+    jar: CookieJar,
+) -> Result<(CookieJar, Redirect), StatusCode> {
     let provider_metadata = provider_metadata(&state).await?;
+    let redirect = redirect_uri()?;
 
     let client = CoreClient::from_provider_metadata(
         provider_metadata,
         ClientId::new(CLIENT_ID.to_owned()),
         None,
     )
-    .set_redirect_uri(redirect_uri()?);
+    .set_redirect_uri(redirect.clone());
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+
+    let browser_binding = CsrfToken::new_random_len(BROWSER_BINDING_BYTES);
+    let browser_binding_secret = browser_binding.secret().to_owned();
+    let browser_binding_hash = hash_browser_binding(&browser_binding_secret);
 
     let (authorization_url, csrf_token, nonce) = client
         .authorize_url(
@@ -160,13 +174,13 @@ async fn login(
             .lock()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        pending.retain(|_, login| login.created_at.elapsed() < LOGIN_TTL);
+        pending.retain(|_, transaction| transaction.created_at.elapsed() < LOGIN_TTL);
 
         let client_ip = peer.ip();
 
         let pending_for_client = pending
             .values()
-            .filter(|login| login.client_ip == client_ip)
+            .filter(|transaction| transaction.client_ip == client_ip)
             .count();
 
         if pending_for_client >= MAX_PENDING_LOGINS_PER_CLIENT {
@@ -179,45 +193,83 @@ async fn login(
 
         pending.insert(
             state_key,
-            PendingLogin {
+            AuthorizationTransaction {
                 pkce_verifier,
                 nonce,
+                browser_binding_hash,
                 created_at: Instant::now(),
                 client_ip,
             },
         );
     }
 
-    Ok(Redirect::temporary(authorization_url.as_str()))
+    let secure_cookie = redirect.url().scheme() == "https";
+
+    let preauth_cookie = Cookie::build((PREAUTH_COOKIE_NAME, browser_binding_secret))
+        .path("/auth")
+        .http_only(true)
+        .secure(secure_cookie)
+        .same_site(SameSite::Lax)
+        .build();
+
+    let jar = jar.add(preauth_cookie);
+
+    Ok((jar, Redirect::temporary(authorization_url.as_str())))
 }
 
 async fn callback(
     State(state): State<OidcState>,
     Query(params): Query<HashMap<String, String>>,
+    jar: CookieJar,
 ) -> Result<StatusCode, StatusCode> {
     let returned_state = params
         .get("state")
         .cloned()
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let pending_login = {
+    let has_error = params.contains_key("error");
+    let code = params.get("code").cloned();
+
+    // A valid authorization response contains either an authorization code
+    // or an OIDC/OAuth error, but not neither.
+    if !has_error && code.is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let browser_binding_secret = jar
+        .get(PREAUTH_COOKIE_NAME)
+        .map(|cookie| cookie.value().to_owned())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let presented_binding_hash = hash_browser_binding(&browser_binding_secret);
+
+    let transaction = {
         let mut pending = state
             .pending
             .lock()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        pending.retain(|_, login| login.created_at.elapsed() < LOGIN_TTL);
+        pending.retain(|_, transaction| transaction.created_at.elapsed() < LOGIN_TTL);
+
+        let binding_matches = pending
+            .get(&returned_state)
+            .map(|transaction| transaction.browser_binding_hash == presented_binding_hash)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+
+        if !binding_matches {
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         pending
             .remove(&returned_state)
             .ok_or(StatusCode::BAD_REQUEST)?
     };
 
-    if params.contains_key("error") {
+    if has_error {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let code = params.get("code").cloned().ok_or(StatusCode::BAD_REQUEST)?;
+    let code = code.ok_or(StatusCode::BAD_REQUEST)?;
 
     let client_secret =
         env::var("RTP_OIDC_CLIENT_SECRET").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -234,7 +286,7 @@ async fn callback(
     let token_response = client
         .exchange_code(AuthorizationCode::new(code))
         .map_err(|_| StatusCode::BAD_GATEWAY)?
-        .set_pkce_verifier(pending_login.pkce_verifier)
+        .set_pkce_verifier(transaction.pkce_verifier)
         .request_async(&state.http_client)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -243,7 +295,7 @@ async fn callback(
 
     let id_token_verifier = client.id_token_verifier();
 
-    match id_token.claims(&id_token_verifier, &pending_login.nonce) {
+    match id_token.claims(&id_token_verifier, &transaction.nonce) {
         Ok(_) => {}
 
         Err(ClaimsVerificationError::SignatureVerification(
@@ -261,7 +313,7 @@ async fn callback(
             let refreshed_verifier = refreshed_client.id_token_verifier();
 
             id_token
-                .claims(&refreshed_verifier, &pending_login.nonce)
+                .claims(&refreshed_verifier, &transaction.nonce)
                 .map_err(|_| StatusCode::UNAUTHORIZED)?;
         }
 
@@ -396,52 +448,107 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
-}
 
-#[tokio::test]
-async fn oidc_error_callback_consumes_pending_transaction() {
-    let http_client = reqwest::ClientBuilder::new()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("OIDC HTTP client must be constructible");
+    #[tokio::test]
+    async fn oidc_error_callback_consumes_pending_transaction() {
+        let http_client = reqwest::ClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("OIDC HTTP client must be constructible");
 
-    let state = OidcState {
-        http_client,
-        provider_metadata: Arc::new(AsyncMutex::new(None)),
-        pending: Arc::new(Mutex::new(HashMap::new())),
-    };
+        let state = OidcState {
+            http_client,
+            provider_metadata: Arc::new(AsyncMutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        };
 
-    let state_key = "test-state".to_owned();
+        let state_key = "test-state".to_owned();
+        let browser_binding_secret = "test-browser-binding";
 
-    let (_, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let (_, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    state
-        .pending
-        .lock()
-        .expect("pending login store must be lockable")
-        .insert(
-            state_key.clone(),
-            PendingLogin {
-                pkce_verifier,
-                nonce: Nonce::new_random(),
-                created_at: Instant::now(),
-                client_ip: IpAddr::from([127, 0, 0, 1]),
-            },
-        );
+        state
+            .pending
+            .lock()
+            .expect("pending login store must be lockable")
+            .insert(
+                state_key.clone(),
+                AuthorizationTransaction {
+                    pkce_verifier,
+                    nonce: Nonce::new_random(),
+                    browser_binding_hash: hash_browser_binding(browser_binding_secret),
+                    created_at: Instant::now(),
+                    client_ip: IpAddr::from([127, 0, 0, 1]),
+                },
+            );
 
-    let params = HashMap::from([
-        ("error".to_owned(), "access_denied".to_owned()),
-        ("state".to_owned(), state_key.clone()),
-    ]);
+        let params = HashMap::from([
+            ("error".to_owned(), "access_denied".to_owned()),
+            ("state".to_owned(), state_key.clone()),
+        ]);
 
-    let result = callback(State(state.clone()), Query(params)).await;
+        let jar = CookieJar::new().add(Cookie::new(PREAUTH_COOKIE_NAME, browser_binding_secret));
 
-    assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+        let result = callback(State(state.clone()), Query(params), jar).await;
 
-    let pending = state
-        .pending
-        .lock()
-        .expect("pending login store must be lockable");
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
 
-    assert!(!pending.contains_key(&state_key));
+        let pending = state
+            .pending
+            .lock()
+            .expect("pending login store must be lockable");
+
+        assert!(!pending.contains_key(&state_key));
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_rejects_wrong_browser_binding_without_consuming_transaction() {
+        let http_client = reqwest::ClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("OIDC HTTP client must be constructible");
+
+        let state = OidcState {
+            http_client,
+            provider_metadata: Arc::new(AsyncMutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let state_key = "test-state".to_owned();
+
+        let (_, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+
+        state
+            .pending
+            .lock()
+            .expect("pending login store must be lockable")
+            .insert(
+                state_key.clone(),
+                AuthorizationTransaction {
+                    pkce_verifier,
+                    nonce: Nonce::new_random(),
+                    browser_binding_hash: hash_browser_binding("browser-a"),
+                    created_at: Instant::now(),
+                    client_ip: IpAddr::from([127, 0, 0, 1]),
+                },
+            );
+
+        let params = HashMap::from([
+            ("error".to_owned(), "access_denied".to_owned()),
+            ("state".to_owned(), state_key.clone()),
+        ]);
+
+        let jar = CookieJar::new().add(Cookie::new(PREAUTH_COOKIE_NAME, "browser-b"));
+
+        let result = callback(State(state.clone()), Query(params), jar).await;
+
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+
+        let pending = state
+            .pending
+            .lock()
+            .expect("pending login store must be lockable");
+
+        assert!(pending.contains_key(&state_key));
+    }
 }
