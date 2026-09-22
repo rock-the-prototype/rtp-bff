@@ -43,7 +43,7 @@ const LOGIN_BURST: u32 = 4;
 const OIDC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-const PREAUTH_COOKIE_NAME: &str = "rtp-preauth";
+const PREAUTH_COOKIE_PREFIX: &str = "rtp-preauth";
 const BROWSER_BINDING_BYTES: u32 = 32;
 
 struct AuthorizationTransaction {
@@ -59,6 +59,17 @@ struct OidcState {
     http_client: reqwest::Client,
     provider_metadata: Arc<AsyncMutex<Option<CoreProviderMetadata>>>,
     pending: Arc<Mutex<HashMap<String, AuthorizationTransaction>>>,
+}
+
+fn preauth_cookie_name(state: &str) -> String {
+    let digest = Sha256::digest(state.as_bytes());
+
+    let suffix = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    format!("{PREAUTH_COOKIE_PREFIX}-{suffix}")
 }
 
 fn hash_browser_binding(secret: &str) -> [u8; 32] {
@@ -167,6 +178,7 @@ async fn login(
         .url();
 
     let state_key = csrf_token.secret().to_owned();
+    let transaction_cookie_name = preauth_cookie_name(&state_key);
 
     {
         let mut pending = state
@@ -205,8 +217,8 @@ async fn login(
 
     let secure_cookie = redirect.url().scheme() == "https";
 
-    let preauth_cookie = Cookie::build((PREAUTH_COOKIE_NAME, browser_binding_secret))
-        .path("/auth")
+    let preauth_cookie = Cookie::build((transaction_cookie_name, browser_binding_secret))
+        .path("/auth/callback")
         .http_only(true)
         .secure(secure_cookie)
         .same_site(SameSite::Lax)
@@ -227,6 +239,8 @@ async fn callback(
         .cloned()
         .ok_or(StatusCode::BAD_REQUEST)?;
 
+    let transaction_cookie_name = preauth_cookie_name(&returned_state);
+
     let has_error = params.contains_key("error");
     let code = params.get("code").cloned();
 
@@ -237,7 +251,7 @@ async fn callback(
     }
 
     let browser_binding_secret = jar
-        .get(PREAUTH_COOKIE_NAME)
+        .get(&transaction_cookie_name)
         .map(|cookie| cookie.value().to_owned())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
@@ -487,7 +501,10 @@ mod tests {
             ("state".to_owned(), state_key.clone()),
         ]);
 
-        let jar = CookieJar::new().add(Cookie::new(PREAUTH_COOKIE_NAME, browser_binding_secret));
+        let jar = CookieJar::new().add(Cookie::new(
+            preauth_cookie_name(&state_key),
+            browser_binding_secret,
+        ));
 
         let result = callback(State(state.clone()), Query(params), jar).await;
 
@@ -538,7 +555,7 @@ mod tests {
             ("state".to_owned(), state_key.clone()),
         ]);
 
-        let jar = CookieJar::new().add(Cookie::new(PREAUTH_COOKIE_NAME, "browser-b"));
+        let jar = CookieJar::new().add(Cookie::new(preauth_cookie_name(&state_key), "browser-b"));
 
         let result = callback(State(state.clone()), Query(params), jar).await;
 
@@ -550,5 +567,101 @@ mod tests {
             .expect("pending login store must be lockable");
 
         assert!(pending.contains_key(&state_key));
+    }
+
+    #[tokio::test]
+    async fn concurrent_authorization_transactions_use_independent_browser_bindings() {
+        let http_client = reqwest::ClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("OIDC HTTP client must be constructible");
+
+        let state = OidcState {
+            http_client,
+            provider_metadata: Arc::new(AsyncMutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let state_one = "state-one".to_owned();
+        let state_two = "state-two".to_owned();
+
+        let binding_one = "browser-binding-one";
+        let binding_two = "browser-binding-two";
+
+        assert_ne!(
+            preauth_cookie_name(&state_one),
+            preauth_cookie_name(&state_two)
+        );
+
+        let (_, pkce_verifier_one) = PkceCodeChallenge::new_random_sha256();
+        let (_, pkce_verifier_two) = PkceCodeChallenge::new_random_sha256();
+
+        {
+            let mut pending = state
+                .pending
+                .lock()
+                .expect("pending transaction store must be lockable");
+
+            pending.insert(
+                state_one.clone(),
+                AuthorizationTransaction {
+                    pkce_verifier: pkce_verifier_one,
+                    nonce: Nonce::new_random(),
+                    browser_binding_hash: hash_browser_binding(binding_one),
+                    created_at: Instant::now(),
+                    client_ip: IpAddr::from([127, 0, 0, 1]),
+                },
+            );
+
+            pending.insert(
+                state_two.clone(),
+                AuthorizationTransaction {
+                    pkce_verifier: pkce_verifier_two,
+                    nonce: Nonce::new_random(),
+                    browser_binding_hash: hash_browser_binding(binding_two),
+                    created_at: Instant::now(),
+                    client_ip: IpAddr::from([127, 0, 0, 1]),
+                },
+            );
+        }
+
+        let jar = CookieJar::new()
+            .add(Cookie::new(preauth_cookie_name(&state_one), binding_one))
+            .add(Cookie::new(preauth_cookie_name(&state_two), binding_two));
+
+        let first_params = HashMap::from([
+            ("error".to_owned(), "access_denied".to_owned()),
+            ("state".to_owned(), state_one.clone()),
+        ]);
+
+        let first_result = callback(State(state.clone()), Query(first_params), jar.clone()).await;
+
+        assert_eq!(first_result, Err(StatusCode::BAD_REQUEST));
+
+        {
+            let pending = state
+                .pending
+                .lock()
+                .expect("pending transaction store must be lockable");
+
+            assert!(!pending.contains_key(&state_one));
+            assert!(pending.contains_key(&state_two));
+        }
+
+        let second_params = HashMap::from([
+            ("error".to_owned(), "access_denied".to_owned()),
+            ("state".to_owned(), state_two.clone()),
+        ]);
+
+        let second_result = callback(State(state.clone()), Query(second_params), jar).await;
+
+        assert_eq!(second_result, Err(StatusCode::BAD_REQUEST));
+
+        let pending = state
+            .pending
+            .lock()
+            .expect("pending transaction store must be lockable");
+
+        assert!(!pending.contains_key(&state_two));
     }
 }
