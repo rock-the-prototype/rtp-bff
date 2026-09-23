@@ -156,6 +156,10 @@ struct OidcState {
     http_client: reqwest::Client,
     client_ip_extractor: SmartIp,
     provider_metadata: Arc<AsyncMutex<Option<CoreProviderMetadata>>>,
+    // Current implementation slice: authorization transactions are process-local.
+    // Deployment is therefore constrained to exactly one BFF replica. A process
+    // restart intentionally invalidates pending logins. Horizontal scaling MUST
+    // replace this store with shared storage providing atomic bound take + TTL.
     pending: Arc<Mutex<HashMap<String, AuthorizationTransaction>>>,
 }
 
@@ -603,7 +607,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{
             HeaderValue, Request,
-            header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
+            header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
         },
         response::IntoResponse,
         routing::{get, post},
@@ -633,6 +637,56 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock must be after UNIX epoch")
             .as_secs()
+    }
+
+    fn base64_standard(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+
+        for chunk in input.chunks(3) {
+            let first = chunk[0];
+            let second = chunk.get(1).copied().unwrap_or_default();
+            let third = chunk.get(2).copied().unwrap_or_default();
+
+            output.push(ALPHABET[(first >> 2) as usize] as char);
+            output.push(ALPHABET[(((first & 0b0000_0011) << 4) | (second >> 4)) as usize] as char);
+
+            if chunk.len() > 1 {
+                output.push(
+                    ALPHABET[(((second & 0b0000_1111) << 2) | (third >> 6)) as usize] as char,
+                );
+            } else {
+                output.push('=');
+            }
+
+            if chunk.len() > 2 {
+                output.push(ALPHABET[(third & 0b0011_1111) as usize] as char);
+            } else {
+                output.push('=');
+            }
+        }
+
+        output
+    }
+
+    fn expected_basic_authorization(client_id: &str, client_secret: &str) -> String {
+        let credentials = format!("{client_id}:{client_secret}");
+        format!("Basic {}", base64_standard(credentials.as_bytes()))
+    }
+
+    fn request_uses_expected_basic_auth(
+        headers: &HeaderMap,
+        client_id: &str,
+        client_secret: &str,
+    ) -> bool {
+        let expected = expected_basic_authorization(client_id, client_secret);
+
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == expected)
     }
 
     fn base64url_no_pad(input: &[u8]) -> String {
@@ -790,11 +844,11 @@ mod tests {
         }
     }
 
-    fn test_state_for_issuer(issuer: &str) -> OidcState {
+    fn test_state_for_issuer(issuer: &str, client_secret: String) -> OidcState {
         let config = OidcConfig::from_values(
             issuer,
             CLIENT_ID,
-            Some(runtime_secret()),
+            Some(client_secret),
             LOCAL_REDIRECT_URI.to_owned(),
             None,
         )
@@ -876,6 +930,7 @@ mod tests {
         id_token: String,
         expected_code: Option<String>,
         expected_verifier: Option<String>,
+        expected_client_secret: String,
     ) -> MockTokenEndpoint {
         let calls = Arc::new(AtomicUsize::new(0));
         let access_token = runtime_secret();
@@ -886,19 +941,43 @@ mod tests {
         let handler_refresh_token = refresh_token.clone();
         let expected_code = Arc::new(expected_code);
         let expected_verifier = Arc::new(expected_verifier);
+        let expected_client_secret = Arc::new(expected_client_secret);
 
         let app = Router::new().route(
             "/token",
-            post(move |body: String| {
+            post(move |headers: HeaderMap, body: String| {
                 let calls = handler_calls.clone();
                 let access_token = handler_access_token.clone();
                 let refresh_token = handler_refresh_token.clone();
                 let id_token = id_token.clone();
                 let expected_code = expected_code.clone();
                 let expected_verifier = expected_verifier.clone();
+                let expected_client_secret = expected_client_secret.clone();
 
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
+
+                    if form_value(&body, "client_secret").is_some() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            [(CONTENT_TYPE, "application/json")],
+                            r#"{"error":"invalid_client"}"#.to_owned(),
+                        )
+                            .into_response();
+                    }
+
+                    if !request_uses_expected_basic_auth(
+                        &headers,
+                        CLIENT_ID,
+                        expected_client_secret.as_str(),
+                    ) {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            [(CONTENT_TYPE, "application/json")],
+                            r#"{"error":"invalid_client"}"#.to_owned(),
+                        )
+                            .into_response();
+                    }
 
                     let code_matches = expected_code
                         .as_ref()
@@ -960,9 +1039,12 @@ mod tests {
         refresh_token: String,
         expected_code: String,
         expected_verifier: String,
+        expected_client_secret: String,
         discovery_calls: Arc<AtomicUsize>,
         jwks_calls: Arc<AtomicUsize>,
         token_calls: Arc<AtomicUsize>,
+        client_auth_failures: Arc<AtomicUsize>,
+        client_secret_body_violations: Arc<AtomicUsize>,
     }
 
     struct MockOidcProvider {
@@ -970,6 +1052,8 @@ mod tests {
         discovery_calls: Arc<AtomicUsize>,
         jwks_calls: Arc<AtomicUsize>,
         token_calls: Arc<AtomicUsize>,
+        client_auth_failures: Arc<AtomicUsize>,
+        client_secret_body_violations: Arc<AtomicUsize>,
         access_token: String,
         refresh_token: String,
     }
@@ -1007,9 +1091,34 @@ mod tests {
 
     async fn mock_provider_token(
         State(state): State<MockProviderState>,
+        headers: HeaderMap,
         body: String,
     ) -> axum::response::Response {
         state.token_calls.fetch_add(1, Ordering::SeqCst);
+
+        if form_value(&body, "client_secret").is_some() {
+            state
+                .client_secret_body_violations
+                .fetch_add(1, Ordering::SeqCst);
+
+            return (
+                StatusCode::BAD_REQUEST,
+                [(CONTENT_TYPE, "application/json")],
+                r#"{"error":"invalid_client"}"#.to_owned(),
+            )
+                .into_response();
+        }
+
+        if !request_uses_expected_basic_auth(&headers, CLIENT_ID, &state.expected_client_secret) {
+            state.client_auth_failures.fetch_add(1, Ordering::SeqCst);
+
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(CONTENT_TYPE, "application/json")],
+                r#"{"error":"invalid_client"}"#.to_owned(),
+            )
+                .into_response();
+        }
 
         let valid_code = form_value(&body, "code") == Some(state.expected_code.as_str());
         let valid_verifier =
@@ -1051,6 +1160,7 @@ mod tests {
         nonce: &str,
         expected_code: String,
         expected_verifier: String,
+        expected_client_secret: String,
     ) -> MockOidcProvider {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1064,6 +1174,8 @@ mod tests {
         let discovery_calls = Arc::new(AtomicUsize::new(0));
         let jwks_calls = Arc::new(AtomicUsize::new(0));
         let token_calls = Arc::new(AtomicUsize::new(0));
+        let client_auth_failures = Arc::new(AtomicUsize::new(0));
+        let client_secret_body_violations = Arc::new(AtomicUsize::new(0));
         let access_token = runtime_secret();
         let refresh_token = runtime_secret();
 
@@ -1076,9 +1188,12 @@ mod tests {
             refresh_token: refresh_token.clone(),
             expected_code,
             expected_verifier,
+            expected_client_secret,
             discovery_calls: discovery_calls.clone(),
             jwks_calls: jwks_calls.clone(),
             token_calls: token_calls.clone(),
+            client_auth_failures: client_auth_failures.clone(),
+            client_secret_body_violations: client_secret_body_violations.clone(),
         };
 
         let app = Router::new()
@@ -1098,6 +1213,8 @@ mod tests {
             discovery_calls,
             jwks_calls,
             token_calls,
+            client_auth_failures,
+            client_secret_body_violations,
             access_token,
             refresh_token,
         }
@@ -1412,6 +1529,7 @@ mod tests {
             signing_key.compact_id_token(nonce.secret()),
             Some(code.clone()),
             Some(verifier.secret().to_owned()),
+            state.config.client_secret.secret().to_owned(),
         )
         .await;
         install_mock_provider_metadata(&state, &signing_key, &token_endpoint.url).await;
@@ -1458,6 +1576,7 @@ mod tests {
             signing_key.compact_id_token(nonce.secret()),
             Some(code.clone()),
             Some(expected_verifier.secret().to_owned()),
+            state.config.client_secret.secret().to_owned(),
         )
         .await;
         install_mock_provider_metadata(&state, &signing_key, &token_endpoint.url).await;
@@ -1643,6 +1762,7 @@ mod tests {
             signing_key.compact_id_token(nonce.secret()),
             Some(code.clone()),
             Some(verifier_value),
+            state.config.client_secret.secret().to_owned(),
         )
         .await;
         install_mock_provider_metadata(&state, &signing_key, &token_endpoint.url).await;
@@ -1798,6 +1918,7 @@ mod tests {
         let code = runtime_secret();
         let (_, verifier) = PkceCodeChallenge::new_random_sha256();
         let verifier_value = verifier.secret().to_owned();
+        let client_secret = runtime_secret();
 
         let provider = spawn_mock_oidc_provider(
             old_key.jwks_json(),
@@ -1806,9 +1927,10 @@ mod tests {
             nonce.secret(),
             code.clone(),
             verifier_value,
+            client_secret.clone(),
         )
         .await;
-        let state = test_state_for_issuer(&provider.issuer);
+        let state = test_state_for_issuer(&provider.issuer, client_secret);
         let state_key = runtime_secret();
         let binding = runtime_secret();
 
@@ -1836,6 +1958,13 @@ mod tests {
         assert_eq!(provider.token_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.discovery_calls.load(Ordering::SeqCst), 2);
         assert_eq!(provider.jwks_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.client_auth_failures.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            provider
+                .client_secret_body_violations
+                .load(Ordering::SeqCst),
+            0,
+        );
 
         let response = (returned_jar, status).into_response();
         assert!(response_removes_cookie(&response, &cookie_name));
@@ -1850,6 +1979,7 @@ mod tests {
         let code = runtime_secret();
         let (_, verifier) = PkceCodeChallenge::new_random_sha256();
         let verifier_value = verifier.secret().to_owned();
+        let client_secret = runtime_secret();
 
         let provider = spawn_mock_oidc_provider(
             stale_key.jwks_json(),
@@ -1858,9 +1988,10 @@ mod tests {
             nonce.secret(),
             code.clone(),
             verifier_value,
+            client_secret.clone(),
         )
         .await;
-        let state = test_state_for_issuer(&provider.issuer);
+        let state = test_state_for_issuer(&provider.issuer, client_secret);
         let state_key = runtime_secret();
         let binding = runtime_secret();
 
@@ -1888,6 +2019,13 @@ mod tests {
         assert_eq!(provider.token_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.discovery_calls.load(Ordering::SeqCst), 2);
         assert_eq!(provider.jwks_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.client_auth_failures.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            provider
+                .client_secret_body_violations
+                .load(Ordering::SeqCst),
+            0,
+        );
 
         let response = (returned_jar, status).into_response();
         assert!(response_removes_cookie(&response, &cookie_name));
@@ -1905,6 +2043,7 @@ mod tests {
             signing_key.compact_id_token(nonce.secret()),
             Some(code.clone()),
             Some(verifier.secret().to_owned()),
+            state.config.client_secret.secret().to_owned(),
         )
         .await;
         install_mock_provider_metadata(&state, &signing_key, &token_endpoint.url).await;
@@ -1949,6 +2088,7 @@ mod tests {
         let code = runtime_secret();
         let (_, verifier) = PkceCodeChallenge::new_random_sha256();
         let verifier_value = verifier.secret().to_owned();
+        let client_secret = runtime_secret();
 
         let provider = spawn_mock_oidc_provider(
             signing_key.jwks_json(),
@@ -1957,12 +2097,12 @@ mod tests {
             nonce.secret(),
             code.clone(),
             verifier_value,
+            client_secret.clone(),
         )
         .await;
-        let state = test_state_for_issuer(&provider.issuer);
+        let state = test_state_for_issuer(&provider.issuer, client_secret.clone());
         let state_key = runtime_secret();
         let binding = runtime_secret();
-        let client_secret = state.config.client_secret.secret().to_owned();
 
         insert_transaction_with(
             &state,
@@ -1989,6 +2129,13 @@ mod tests {
         assert_eq!(provider.token_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.discovery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.jwks_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.client_auth_failures.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            provider
+                .client_secret_body_violations
+                .load(Ordering::SeqCst),
+            0,
+        );
 
         assert!(
             !state
@@ -2022,5 +2169,64 @@ mod tests {
         assert_eq!(provider.token_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.discovery_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.jwks_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn confidential_client_exchange_uses_client_secret_basic_only() {
+        let signing_key = EphemeralEs256Key::generate();
+        let nonce = Nonce::new_random();
+        let code = runtime_secret();
+        let (_, verifier) = PkceCodeChallenge::new_random_sha256();
+        let verifier_value = verifier.secret().to_owned();
+        let client_secret = runtime_secret();
+
+        let provider = spawn_mock_oidc_provider(
+            signing_key.jwks_json(),
+            None,
+            &signing_key,
+            nonce.secret(),
+            code.clone(),
+            verifier_value,
+            client_secret.clone(),
+        )
+        .await;
+        let state = test_state_for_issuer(&provider.issuer, client_secret);
+        let state_key = runtime_secret();
+        let binding = runtime_secret();
+
+        insert_transaction_with(
+            &state,
+            &state_key,
+            &binding,
+            verifier,
+            nonce,
+            Instant::now(),
+        );
+
+        let params = HashMap::from([
+            ("code".to_owned(), code),
+            ("state".to_owned(), state_key.clone()),
+        ]);
+        let cookie_name = preauth_cookie_name(&state_key);
+        let jar = request_cookie_jar(&[(&cookie_name, &binding)]);
+
+        let (_, status) = callback(State(state), Query(params), jar)
+            .await
+            .expect("confidential-client callback must succeed");
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(provider.token_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.client_auth_failures.load(Ordering::SeqCst),
+            0,
+            "token endpoint must receive the expected client_secret_basic credentials",
+        );
+        assert_eq!(
+            provider
+                .client_secret_body_violations
+                .load(Ordering::SeqCst),
+            0,
+            "client secret must never be sent in the token request form body",
+        );
     }
 }
