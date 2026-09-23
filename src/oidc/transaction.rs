@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use openidconnect::{Nonce, PkceCodeVerifier};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use time::Duration as CookieDuration;
 
 use super::config::OIDC_CALLBACK_PATH;
@@ -86,7 +87,13 @@ pub(super) fn take_bound_transaction(
 
     let binding_matches = pending
         .get(returned_state)
-        .map(|transaction| transaction.browser_binding_hash == presented_binding_hash)
+        .map(|transaction| {
+            bool::from(
+                transaction
+                    .browser_binding_hash
+                    .ct_eq(&presented_binding_hash),
+            )
+        })
         .ok_or(StatusCode::BAD_REQUEST)?;
 
     if !binding_matches {
