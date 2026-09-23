@@ -1,7 +1,10 @@
+pub mod oidc;
 use axum::{Router, http::StatusCode, routing::get};
 
 pub fn app() -> Router {
-    Router::new().route("/health", get(health))
+    Router::new()
+        .route("/health", get(health))
+        .merge(oidc::router())
 }
 
 async fn health() -> StatusCode {
