@@ -306,5 +306,3 @@ async fn expired_transaction_is_rejected_before_token_exchange() {
             .contains_key(&state_key)
     );
 }
-
-// AC-OIDC-TXN-002, AC-OIDC-TXN-005, AC-OIDC-TXN-016,

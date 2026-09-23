@@ -9,7 +9,11 @@ use openidconnect::{ClientSecret, IssuerUrl, RedirectUrl, core::CoreJwsSigningAl
 use openidconnect::CsrfToken;
 
 pub(super) const ISSUER: &str = "https://id.rock-the-prototype.com/realms/RTP";
+
 pub(super) const CLIENT_ID: &str = "rtp-web";
+
+pub(super) const OIDC_CALLBACK_PATH: &str = "/auth/callback";
+
 pub(super) const LOCAL_REDIRECT_URI: &str = "http://127.0.0.1:3000/auth/callback";
 
 const CLIENT_SECRET_ENV: &str = "RTP_OIDC_CLIENT_SECRET";
@@ -57,8 +61,10 @@ impl OidcConfig {
 
         let issuer = IssuerUrl::new(issuer_raw.to_owned())
             .map_err(|_| "OIDC issuer URL is invalid".to_owned())?;
+
         let redirect_uri = validate_redirect_uri(redirect_raw)
             .map_err(|_| "OIDC redirect URI is invalid or insecure".to_owned())?;
+
         let trusted_proxy_cidrs = parse_trusted_proxy_cidrs(trusted_proxy_cidrs_raw)?;
 
         Ok(Self {
@@ -94,8 +100,9 @@ impl OidcConfig {
 }
 
 pub(super) fn accepted_id_token_signing_algorithms() -> [CoreJwsSigningAlgorithm; 1] {
-    // RTP security profile. OIDC requires signature validation; ES256 is the
-    // currently selected deployment profile and MUST match Keycloak configuration.
+    // OIDC requires ID-token signature validation.
+    // ES256 is the currently selected RTP deployment profile and MUST match
+    // the Keycloak configuration.
     [CoreJwsSigningAlgorithm::EcdsaP256Sha256]
 }
 
@@ -117,16 +124,20 @@ fn parse_trusted_proxy_cidrs(raw: Option<String>) -> Result<Vec<IpNet>, String> 
 
 pub(super) fn validate_redirect_uri(raw: String) -> Result<RedirectUrl, StatusCode> {
     let redirect = RedirectUrl::new(raw).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     let url = redirect.url();
 
     let is_loopback = matches!(
         url.host_str(),
         Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
     );
+
     let is_https = url.scheme() == "https";
     let is_loopback_http = url.scheme() == "http" && is_loopback;
 
-    if !is_https && !is_loopback_http {
+    let targets_callback = url.path() == OIDC_CALLBACK_PATH && url.fragment().is_none();
+
+    if (!is_https && !is_loopback_http) || !targets_callback {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 

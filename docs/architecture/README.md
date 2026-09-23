@@ -138,13 +138,6 @@ This restriction applies to authorization transactions only. OAuth access
 tokens, refresh tokens and the OIDC client secret remain server-side and MUST
 NOT be exposed to the browser.
 
-Forwarded client-address headers are trusted only when the immediate network
-peer belongs to an explicitly configured trusted-proxy CIDR. Without such a
-configuration the socket peer address is authoritative.
-
-OAuth access tokens, refresh tokens and the OIDC client secret remain inside
-the BFF trust boundary and are not exposed to the browser.
-
 The current implementation does not yet establish the final authenticated RTP
 browser session. Session creation, authenticated application cookies and
 application authorization remain part of the target architecture.

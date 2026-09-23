@@ -11,11 +11,13 @@ use openidconnect::{Nonce, PkceCodeVerifier};
 use sha2::{Digest, Sha256};
 use time::Duration as CookieDuration;
 
+use super::config::OIDC_CALLBACK_PATH;
+
 pub(super) const LOGIN_TTL_SECONDS: i64 = 300;
 pub(super) const LOGIN_TTL: Duration = Duration::from_secs(LOGIN_TTL_SECONDS as u64);
 pub(super) const MAX_PENDING_LOGINS: usize = 128;
 pub(super) const MAX_PENDING_LOGINS_PER_CLIENT: usize = 8;
-pub(super) const PREAUTH_COOKIE_PATH: &str = "/auth/callback";
+pub(super) const PREAUTH_COOKIE_PATH: &str = OIDC_CALLBACK_PATH;
 pub(super) const BROWSER_BINDING_BYTES: u32 = 32;
 
 const PREAUTH_COOKIE_PREFIX: &str = "rtp-preauth";
