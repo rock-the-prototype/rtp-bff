@@ -14,6 +14,7 @@ mod handlers;
 mod provider;
 mod transaction;
 
+use crate::session::SessionStore;
 use config::{OIDC_CALLBACK_PATH, OidcConfig};
 use handlers::{callback, login};
 use provider::build_http_client;
@@ -28,6 +29,7 @@ struct OidcState {
     http_client: openidconnect::reqwest::Client,
     client_ip_extractor: SmartIp,
     provider_metadata: Arc<AsyncMutex<Option<CoreProviderMetadata>>>,
+    session_store: SessionStore,
     // Current implementation slice: authorization transactions are process-local.
     // Deployment is therefore constrained to exactly one BFF replica. A process
     // restart intentionally invalidates pending logins. Horizontal scaling MUST
@@ -63,11 +65,20 @@ fn router_with_config(config: OidcConfig) -> Router {
         .finish()
         .expect("login rate-limit configuration must be valid");
 
+    #[cfg(test)]
+    let session_store = SessionStore::for_tests();
+
+    #[cfg(not(test))]
+    let session_store = SessionStore::from_env().unwrap_or_else(|error| {
+        panic!("BFF session-store startup configuration invalid: {error}");
+    });
+
     let state = OidcState {
         config: Arc::new(config),
         http_client,
         client_ip_extractor,
         provider_metadata: Arc::new(AsyncMutex::new(None)),
+        session_store,
         pending: Arc::new(Mutex::new(HashMap::new())),
     };
 

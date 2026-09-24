@@ -35,16 +35,16 @@ production network topology.
 Initially:
 ```mermaid
 flowchart LR
-    Browser["Browser / RTP Web"]
-    BFF["rtp-bff"]
-    Keycloak["Keycloak"]
-    Session["Session Store"]
-    Profile["RTP Profile / Onboarding"]
+  Browser["Browser / RTP Web"]
+  BFF["rtp-bff"]
+  Keycloak["Keycloak"]
+  Session["Redis / BFF Session Store"]
+  Profile["RTP Profile / Onboarding"]
 
-    Browser -->|"HTTPS + secure session cookie"| BFF
-    BFF -->|"OIDC Authorization Code + PKCE"| Keycloak
-    BFF --> Session
-    BFF --> Profile
+  Browser -->|"HTTPS + secure session cookie"| BFF
+  BFF -->|"OIDC Authorization Code + PKCE"| Keycloak
+  BFF --> Session
+  BFF --> Profile
 ```
 Then:
 
@@ -92,6 +92,12 @@ The authentication flow currently implements:
 - exactly one metadata/JWKS refresh after `NoMatchingKey`
 - server-side authorization-code exchange
 - ID-token signature, issuer, audience, nonce and temporal validation
+- authenticated BFF session creation after successful token validation
+- opaque browser session identifier
+- server-side access/refresh-token association
+- Redis-backed production session-store adapter
+- `HttpOnly` authenticated session cookie; production profile uses `Secure`,
+  `SameSite=Strict`, `Path=/`, no `Domain`, and `__Host-Http-` prefix
 
 ### OIDC runtime configuration
 
@@ -102,6 +108,11 @@ OIDC runtime configuration is read from:
   `http://127.0.0.1:3000/auth/callback` for local development.
 - `RTP_TRUSTED_PROXY_CIDRS` — optional; comma-separated CIDR list of
   explicitly trusted reverse proxies.
+- `RTP_REDIS_URL` — required in non-test runtime; connection URL for the
+  dedicated BFF Redis session store. This value can contain credentials and
+  MUST NOT be logged.
+- `RTP_BFF_SESSION_TTL_SECONDS` — required in non-test runtime; positive
+  bounded lifetime for authenticated BFF sessions.
 
 The BFF validates this configuration when constructing the router.
 A missing client secret, an invalid redirect URI, or an invalid trusted-proxy
@@ -138,9 +149,13 @@ This restriction applies to authorization transactions only. OAuth access
 tokens, refresh tokens and the OIDC client secret remain server-side and MUST
 NOT be exposed to the browser.
 
-The current implementation does not yet establish the final authenticated RTP
-browser session. Session creation, authenticated application cookies and
-application authorization remain part of the target architecture.
+The current implementation now establishes the first authenticated RTP BFF
+session slice after successful OIDC token validation. OAuth access/refresh
+tokens remain server-side and are associated with an opaque browser session
+identifier. Production session state is stored in a dedicated Redis store.
+
+The check-session API, token-refresh lifecycle, resource-server proxy, CSRF
+protection for authenticated API calls, and logout remain future slices.
 
 | ID | Requirement | Scenario | Expected observation |
 |---|---|---|---|
@@ -166,10 +181,7 @@ application authorization remain part of the target architecture.
 
 Not implemented in the current slice:
 
-- authenticated user session
-- session cookie
 - check-session endpoint
-- access/refresh-token association
 - token refresh lifecycle
 - resource-server proxy
 - proxy destination allowlist
