@@ -43,6 +43,8 @@ pub(super) use time::Duration as CookieDuration;
 pub(super) use tokio::sync::{Barrier, Mutex as AsyncMutex};
 pub(super) use tower::ServiceExt;
 
+pub(super) use crate::session::{SessionStore, session_cookie_name};
+
 pub(super) use super::super::{
     LOGIN_BURST, LOGIN_REQUESTS_PER_MINUTE, OidcState,
     config::{CLIENT_ID, ISSUER, LOCAL_REDIRECT_URI, OidcConfig, validate_redirect_uri},
@@ -261,6 +263,7 @@ pub(super) fn test_state() -> OidcState {
         http_client,
         client_ip_extractor,
         provider_metadata: Arc::new(AsyncMutex::new(None)),
+        session_store: SessionStore::for_tests(),
         pending: Arc::new(Mutex::new(HashMap::new())),
     }
 }
@@ -285,6 +288,7 @@ pub(super) fn test_state_for_issuer(issuer: &str, client_secret: String) -> Oidc
         http_client,
         client_ip_extractor,
         provider_metadata: Arc::new(AsyncMutex::new(None)),
+        session_store: SessionStore::for_tests(),
         pending: Arc::new(Mutex::new(HashMap::new())),
     }
 }

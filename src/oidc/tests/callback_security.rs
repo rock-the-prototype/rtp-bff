@@ -372,6 +372,24 @@ async fn successful_callback_completes_flow_removes_cookie_and_prevents_replay()
             .contains_key(&state_key)
     );
 
+    let authenticated_cookie_name = session_cookie_name(state.config.secure_cookie());
+    let authenticated_cookie = returned_jar
+        .get(authenticated_cookie_name)
+        .expect("successful callback must establish an authenticated BFF session");
+    let stored_session = state
+        .session_store
+        .get(authenticated_cookie.value())
+        .await
+        .expect("test session-store read must succeed")
+        .expect("authenticated BFF session must exist server-side");
+
+    assert_eq!(stored_session.access_token, provider.access_token);
+    assert_eq!(
+        stored_session.refresh_token.as_deref(),
+        Some(provider.refresh_token.as_str()),
+    );
+    assert!(stored_session.access_token_expires_at.is_some());
+
     let response = (returned_jar, status).into_response();
     assert!(response_removes_cookie(&response, &cookie_name));
 
@@ -397,6 +415,64 @@ async fn successful_callback_completes_flow_removes_cookie_and_prevents_replay()
     assert_eq!(provider.discovery_calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.jwks_calls.load(Ordering::SeqCst), 1);
 }
+// AC-BFF-SESSION-006
+#[tokio::test]
+async fn session_store_failure_fails_closed_without_authenticated_cookie() {
+    let signing_key = EphemeralEs256Key::generate();
+    let nonce = Nonce::new_random();
+    let code = runtime_secret();
+    let (_, verifier) = PkceCodeChallenge::new_random_sha256();
+    let verifier_value = verifier.secret().to_owned();
+    let client_secret = runtime_secret();
+
+    let provider = spawn_mock_oidc_provider(
+        signing_key.jwks_json(),
+        None,
+        &signing_key,
+        nonce.secret(),
+        code.clone(),
+        verifier_value,
+        client_secret.clone(),
+    )
+    .await;
+    let mut state = test_state_for_issuer(&provider.issuer, client_secret);
+    state.session_store = SessionStore::for_tests_failing_writes();
+    let state_key = runtime_secret();
+    let binding = runtime_secret();
+
+    insert_transaction_with(
+        &state,
+        &state_key,
+        &binding,
+        verifier,
+        nonce,
+        Instant::now(),
+    );
+
+    let params = HashMap::from([
+        ("code".to_owned(), code),
+        ("state".to_owned(), state_key.clone()),
+    ]);
+    let preauth_cookie = preauth_cookie_name(&state_key);
+    let jar = request_cookie_jar(&[(&preauth_cookie, &binding)]);
+
+    let (returned_jar, status) = callback(State(state.clone()), Query(params), jar)
+        .await
+        .expect_err("session-store failure must fail closed");
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(provider.token_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        returned_jar
+            .get(session_cookie_name(state.config.secure_cookie()))
+            .is_none(),
+        "no authenticated BFF cookie may be issued when session persistence fails",
+    );
+
+    let response = (returned_jar, status).into_response();
+    assert!(response_removes_cookie(&response, &preauth_cookie));
+}
+
 #[tokio::test]
 async fn confidential_client_exchange_uses_client_secret_basic_only() {
     let signing_key = EphemeralEs256Key::generate();

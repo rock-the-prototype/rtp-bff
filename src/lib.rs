@@ -1,4 +1,5 @@
 pub mod oidc;
+mod session;
 use axum::{Router, http::StatusCode, routing::get};
 
 pub fn app() -> Router {

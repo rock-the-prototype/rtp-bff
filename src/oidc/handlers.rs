@@ -8,8 +8,13 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use axum_governor::extractor::KeyExtractor;
 use openidconnect::{
-    AuthorizationCode, ClientId, CsrfToken, Nonce, PkceCodeChallenge, Scope, TokenResponse,
+    AuthorizationCode, ClientId, CsrfToken, Nonce, OAuth2TokenResponse, PkceCodeChallenge, Scope,
+    TokenResponse,
     core::{CoreAuthenticationFlow, CoreClient},
+};
+
+use crate::session::{
+    AuthenticatedSession, access_token_expiry, build_session_cookie, new_session_id,
 };
 
 use super::{
@@ -202,8 +207,33 @@ pub(super) async fn callback(
     )
     .await;
 
-    match verification {
-        Ok(()) => Ok((jar, StatusCode::NO_CONTENT)),
-        Err(status) => Err((jar, status)),
+    if let Err(status) = verification {
+        return Err((jar, status));
     }
+
+    let authenticated_session = AuthenticatedSession {
+        access_token: token_response.access_token().secret().to_owned(),
+        refresh_token: token_response
+            .refresh_token()
+            .map(|token| token.secret().to_owned()),
+        access_token_expires_at: access_token_expiry(token_response.expires_in()),
+    };
+    let session_id = new_session_id();
+
+    if state
+        .session_store
+        .put(&session_id, &authenticated_session)
+        .await
+        .is_err()
+    {
+        return Err((jar, StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    let session_cookie = build_session_cookie(
+        session_id,
+        state.config.secure_cookie(),
+        state.session_store.ttl(),
+    );
+
+    Ok((jar.add(session_cookie), StatusCode::NO_CONTENT))
 }
