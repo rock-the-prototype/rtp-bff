@@ -65,6 +65,31 @@ The Redis BFF session store MUST remain a private dependency of `rtp-bff`.
 Neither browser clients nor Keycloak require direct access to this store for the
 BFF session mechanism.
 
+### REQ-BFF-SESSION-009 — Authenticated session resolution
+
+The BFF MUST provide a check-session endpoint that resolves the presented
+opaque BFF session identifier against the private server-side session store.
+
+The endpoint MUST return:
+
+- `204 No Content` when an active authenticated session exists;
+- `401 Unauthorized` when no authenticated BFF session exists;
+- `503 Service Unavailable` when the session store cannot be queried.
+
+The endpoint MUST NOT expose access tokens, refresh tokens, client credentials,
+or other server-side OAuth security material to the browser.
+
+Session lookup MUST NOT extend the configured server-side session TTL.
+
+### REQ-BFF-SESSION-010 — Authentication-state responses are not cacheable
+
+Every response from the check-session endpoint MUST include:
+
+`Cache-Control: no-store`
+
+Authentication-state responses MUST NOT be reusable from browser or
+intermediary caches.
+
 ## Acceptance Criteria
 
 | ID | Requirement | Scenario | Expected observation |
@@ -75,6 +100,11 @@ BFF session mechanism.
 | AC-BFF-SESSION-004 | REQ-005 | Build production session cookie | `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, no `Domain`, `__Host-Http-` prefix |
 | AC-BFF-SESSION-005 | REQ-006 | Persist session | Session has bounded store TTL and cookie max-age does not exceed it |
 | AC-BFF-SESSION-006 | REQ-007 | Session-store write fails | Callback fails and no authenticated session cookie is issued |
+| AC-BFF-SESSION-007 | REQ-BFF-SESSION-009 | Check session without cookie | `401 Unauthorized` |
+| AC-BFF-SESSION-008 | REQ-BFF-SESSION-009 | Check active stored session | `204 No Content` |
+| AC-BFF-SESSION-009 | REQ-BFF-SESSION-009 | Check unknown/stale session | `401 Unauthorized` |
+| AC-BFF-SESSION-010 | REQ-BFF-SESSION-009 | Session-store read fails | `503 Service Unavailable` |
+| AC-BFF-SESSION-011 | REQ-BFF-SESSION-010 | Inspect all check-session responses | `Cache-Control: no-store` is present |
 
 ## Evidence Mapping
 

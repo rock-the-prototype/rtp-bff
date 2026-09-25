@@ -64,6 +64,13 @@ lifetime of the associated refresh-token context.
 If the authenticated session cannot be written to Redis, authentication MUST
 fail closed: the BFF MUST NOT issue an authenticated browser-session cookie.
 
+Authenticated-session lookup is performed by the BFF against the private Redis
+session store. Lookup MUST NOT refresh the Redis TTL.
+
+The browser-facing check-session response MUST use `Cache-Control: no-store`
+for every outcome so that authentication state cannot be reused from browser
+or intermediary caches.
+
 ## Isolation boundary
 
 Redis is a private dependency of `rtp-bff`, not a Keycloak datastore.

@@ -154,8 +154,21 @@ session slice after successful OIDC token validation. OAuth access/refresh
 tokens remain server-side and are associated with an opaque browser session
 identifier. Production session state is stored in a dedicated Redis store.
 
-The check-session API, token-refresh lifecycle, resource-server proxy, CSRF
-protection for authenticated API calls, and logout remain future slices.
+The authenticated session can now be resolved through `GET /auth/session`.
+
+The endpoint resolves the opaque BFF session cookie against the private
+Redis-backed session store and returns:
+
+- `204 No Content` for an active authenticated session;
+- `401 Unauthorized` when no valid BFF session is available;
+- `503 Service Unavailable` when the session store cannot be queried.
+
+All check-session responses use `Cache-Control: no-store`. The endpoint does
+not expose OAuth access tokens, refresh tokens, or identity data to the browser,
+and session lookup does not extend the Redis session TTL.
+
+The token-refresh lifecycle, resource-server proxy, CSRF protection for
+authenticated API calls, and logout remain future slices.
 
 | ID | Requirement | Scenario | Expected observation |
 |---|---|---|---|
@@ -181,8 +194,8 @@ protection for authenticated API calls, and logout remain future slices.
 
 Not implemented in the current slice:
 
-- check-session endpoint
 - token refresh lifecycle
 - resource-server proxy
 - proxy destination allowlist
+- CSRF protection for authenticated application requests
 - logout

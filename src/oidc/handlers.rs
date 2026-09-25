@@ -2,8 +2,8 @@ use std::{collections::HashMap, net::SocketAddr, time::Instant};
 
 use axum::{
     extract::{ConnectInfo, Query, State},
-    http::{HeaderMap, Request, StatusCode},
-    response::Redirect,
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header::CACHE_CONTROL},
+    response::{IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::cookie::CookieJar;
 use axum_governor::extractor::KeyExtractor;
@@ -30,18 +30,30 @@ use super::{
 
 pub(super) type CallbackResult = Result<(CookieJar, StatusCode), (CookieJar, StatusCode)>;
 
-pub(super) async fn check_session(State(state): State<OidcState>, jar: CookieJar) -> StatusCode {
+fn no_store_status(status: StatusCode) -> Response {
+    let mut response = status.into_response();
+
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    response
+}
+
+pub(super) async fn check_session(State(state): State<OidcState>, jar: CookieJar) -> Response {
     let cookie_name = session_cookie_name(state.config.secure_cookie());
 
     let Some(cookie) = jar.get(cookie_name) else {
-        return StatusCode::UNAUTHORIZED;
+        return no_store_status(StatusCode::UNAUTHORIZED);
     };
 
-    match state.session_store.get(cookie.value()).await {
+    let status = match state.session_store.get(cookie.value()).await {
         Ok(Some(_)) => StatusCode::NO_CONTENT,
         Ok(None) => StatusCode::UNAUTHORIZED,
         Err(()) => StatusCode::SERVICE_UNAVAILABLE,
-    }
+    };
+
+    no_store_status(status)
 }
 
 pub(super) fn extract_client_ip(

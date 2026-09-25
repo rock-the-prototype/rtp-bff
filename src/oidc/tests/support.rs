@@ -21,7 +21,7 @@ pub(super) use axum::{
     extract::{ConnectInfo, Query, State},
     http::{
         HeaderMap, HeaderValue, Request, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
     },
     response::IntoResponse,
     routing::{get, post},
