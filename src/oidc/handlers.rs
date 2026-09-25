@@ -15,6 +15,7 @@ use openidconnect::{
 
 use crate::session::{
     AuthenticatedSession, access_token_expiry, build_session_cookie, new_session_id,
+    session_cookie_name,
 };
 
 use super::{
@@ -28,6 +29,20 @@ use super::{
 };
 
 pub(super) type CallbackResult = Result<(CookieJar, StatusCode), (CookieJar, StatusCode)>;
+
+pub(super) async fn check_session(State(state): State<OidcState>, jar: CookieJar) -> StatusCode {
+    let cookie_name = session_cookie_name(state.config.secure_cookie());
+
+    let Some(cookie) = jar.get(cookie_name) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+
+    match state.session_store.get(cookie.value()).await {
+        Ok(Some(_)) => StatusCode::NO_CONTENT,
+        Ok(None) => StatusCode::UNAUTHORIZED,
+        Err(()) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
 
 pub(super) fn extract_client_ip(
     extractor: &axum_governor::extractor::SmartIp,

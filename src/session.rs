@@ -14,6 +14,7 @@ const SESSION_ID_BYTES: u32 = 32;
 
 #[cfg(not(test))]
 const SESSION_KEY_PREFIX: &str = "rtp:bff:session:";
+
 const PROD_SESSION_COOKIE_NAME: &str = "__Host-Http-rtp_session";
 const DEV_SESSION_COOKIE_NAME: &str = "rtp_session_dev";
 
@@ -45,6 +46,7 @@ pub(super) struct SessionStore {
 pub(super) struct SessionStore {
     sessions: Arc<Mutex<HashMap<String, StoredTestSession>>>,
     fail_writes: bool,
+    fail_reads: bool,
     ttl: Duration,
 }
 
@@ -97,6 +99,7 @@ impl SessionStore {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             fail_writes: false,
+            fail_reads: false,
             ttl: Duration::from_secs(3600),
         }
     }
@@ -106,6 +109,17 @@ impl SessionStore {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             fail_writes: true,
+            fail_reads: false,
+            ttl: Duration::from_secs(3600),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_tests_failing_reads() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            fail_writes: false,
+            fail_reads: true,
             ttl: Duration::from_secs(3600),
         }
     }
@@ -145,6 +159,33 @@ impl SessionStore {
             .map_err(|_| ())
     }
 
+    #[cfg(not(test))]
+    pub(super) async fn get(&self, session_id: &str) -> Result<Option<AuthenticatedSession>, ()> {
+        let key = session_key(session_id);
+        let mut connection = self.redis.clone();
+
+        let values: (Option<String>, Option<String>, Option<u64>) = redis::cmd("HMGET")
+            .arg(&key)
+            .arg("access_token")
+            .arg("refresh_token")
+            .arg("access_token_expires_at")
+            .query_async(&mut connection)
+            .await
+            .map_err(|_| ())?;
+
+        let (access_token, refresh_token, access_token_expires_at) = values;
+
+        let Some(access_token) = access_token else {
+            return Ok(None);
+        };
+
+        Ok(Some(AuthenticatedSession {
+            access_token,
+            refresh_token: refresh_token.filter(|token| !token.is_empty()),
+            access_token_expires_at: access_token_expires_at.filter(|timestamp| *timestamp != 0),
+        }))
+    }
+
     #[cfg(test)]
     pub(super) async fn put(
         &self,
@@ -169,6 +210,10 @@ impl SessionStore {
 
     #[cfg(test)]
     pub(super) async fn get(&self, session_id: &str) -> Result<Option<AuthenticatedSession>, ()> {
+        if self.fail_reads {
+            return Err(());
+        }
+
         let mut sessions = self.sessions.lock().await;
         sessions.retain(|_, stored| stored.stored_at.elapsed() < self.ttl);
         Ok(sessions
@@ -212,7 +257,7 @@ pub(super) fn access_token_expiry(expires_in: Option<Duration>) -> Option<u64> {
     expires_at
         .duration_since(UNIX_EPOCH)
         .ok()
-        .map(|d| d.as_secs())
+        .map(|duration| duration.as_secs())
 }
 
 #[cfg(not(test))]
@@ -228,7 +273,6 @@ mod tests {
     async fn session_store_keeps_tokens_server_side() {
         let store = SessionStore::for_tests();
         let session_id = new_session_id();
-
         let session = AuthenticatedSession {
             access_token: "access-secret".to_owned(),
             refresh_token: Some("refresh-secret".to_owned()),
