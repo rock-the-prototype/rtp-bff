@@ -16,7 +16,7 @@ mod transaction;
 
 use crate::session::SessionStore;
 use config::{OIDC_CALLBACK_PATH, OidcConfig};
-use handlers::{callback, login};
+use handlers::{callback, check_session, login};
 use provider::build_http_client;
 use transaction::AuthorizationTransaction;
 
@@ -89,6 +89,7 @@ fn router_with_config(config: OidcConfig) -> Router {
     Router::new()
         .merge(login_router)
         .route(OIDC_CALLBACK_PATH, get(callback))
+        .route("/auth/session", get(check_session))
         .with_state(state)
 }
 

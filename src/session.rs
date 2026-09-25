@@ -4,15 +4,12 @@ use std::{time::Duration, time::SystemTime, time::UNIX_EPOCH};
 
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use openidconnect::CsrfToken;
-#[cfg(not(test))]
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use time::Duration as CookieDuration;
 #[cfg(test)]
 use tokio::sync::Mutex;
 
 const SESSION_ID_BYTES: u32 = 32;
-
-#[cfg(not(test))]
 const SESSION_KEY_PREFIX: &str = "rtp:bff:session:";
 const PROD_SESSION_COOKIE_NAME: &str = "__Host-Http-rtp_session";
 const DEV_SESSION_COOKIE_NAME: &str = "rtp_session_dev";
@@ -21,9 +18,10 @@ const DEV_SESSION_COOKIE_NAME: &str = "rtp_session_dev";
 const REDIS_URL_ENV: &str = "RTP_REDIS_URL";
 #[cfg(not(test))]
 const SESSION_TTL_SECONDS_ENV: &str = "RTP_BFF_SESSION_TTL_SECONDS";
-#[cfg(not(test))]
+#[cfg(test)]
+const REDIS_INTEGRATION_URL_ENV: &str = "RTP_REDIS_INTEGRATION_URL";
+
 const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(not(test))]
 const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -45,6 +43,7 @@ pub(super) struct SessionStore {
 pub(super) struct SessionStore {
     sessions: Arc<Mutex<HashMap<String, StoredTestSession>>>,
     fail_writes: bool,
+    fail_reads: bool,
     ttl: Duration,
 }
 
@@ -77,14 +76,7 @@ impl SessionStore {
             ));
         }
 
-        let client = redis::Client::open(redis_url)
-            .map_err(|_| format!("{REDIS_URL_ENV} is not a valid Redis URL"))?;
-        let manager_config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(REDIS_CONNECT_TIMEOUT))
-            .set_response_timeout(Some(REDIS_RESPONSE_TIMEOUT));
-        let redis = client
-            .get_connection_manager_lazy(manager_config)
-            .map_err(|_| "Redis connection manager configuration is invalid".to_owned())?;
+        let redis = redis_connection_manager(&redis_url)?;
 
         Ok(Self {
             redis,
@@ -97,6 +89,7 @@ impl SessionStore {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             fail_writes: false,
+            fail_reads: false,
             ttl: Duration::from_secs(3600),
         }
     }
@@ -106,6 +99,17 @@ impl SessionStore {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             fail_writes: true,
+            fail_reads: false,
+            ttl: Duration::from_secs(3600),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_tests_failing_reads() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            fail_writes: false,
+            fail_reads: true,
             ttl: Duration::from_secs(3600),
         }
     }
@@ -120,29 +124,12 @@ impl SessionStore {
         session_id: &str,
         session: &AuthenticatedSession,
     ) -> Result<(), ()> {
-        let key = session_key(session_id);
-        let mut connection = self.redis.clone();
-        let refresh_token = session.refresh_token.as_deref().unwrap_or("");
-        let access_token_expires_at = session.access_token_expires_at.unwrap_or(0);
+        redis_put(&self.redis, self.ttl, session_id, session).await
+    }
 
-        redis::pipe()
-            .atomic()
-            .cmd("HSET")
-            .arg(&key)
-            .arg("access_token")
-            .arg(&session.access_token)
-            .arg("refresh_token")
-            .arg(refresh_token)
-            .arg("access_token_expires_at")
-            .arg(access_token_expires_at)
-            .ignore()
-            .cmd("EXPIRE")
-            .arg(&key)
-            .arg(self.ttl.as_secs())
-            .ignore()
-            .query_async::<()>(&mut connection)
-            .await
-            .map_err(|_| ())
+    #[cfg(not(test))]
+    pub(super) async fn get(&self, session_id: &str) -> Result<Option<AuthenticatedSession>, ()> {
+        redis_get(&self.redis, session_id).await
     }
 
     #[cfg(test)]
@@ -169,12 +156,95 @@ impl SessionStore {
 
     #[cfg(test)]
     pub(super) async fn get(&self, session_id: &str) -> Result<Option<AuthenticatedSession>, ()> {
+        if self.fail_reads {
+            return Err(());
+        }
+
         let mut sessions = self.sessions.lock().await;
         sessions.retain(|_, stored| stored.stored_at.elapsed() < self.ttl);
+
         Ok(sessions
             .get(session_id)
             .map(|stored| stored.session.clone()))
     }
+}
+
+fn redis_connection_manager(redis_url: &str) -> Result<ConnectionManager, String> {
+    let client = redis::Client::open(redis_url).map_err(|_| "Redis URL is invalid".to_owned())?;
+    let manager_config = ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(REDIS_CONNECT_TIMEOUT))
+        .set_response_timeout(Some(REDIS_RESPONSE_TIMEOUT));
+
+    client
+        .get_connection_manager_lazy(manager_config)
+        .map_err(|_| "Redis connection manager configuration is invalid".to_owned())
+}
+
+async fn redis_put(
+    redis: &ConnectionManager,
+    ttl: Duration,
+    session_id: &str,
+    session: &AuthenticatedSession,
+) -> Result<(), ()> {
+    let key = session_key(session_id);
+    let mut connection = redis.clone();
+    let refresh_token = session.refresh_token.as_deref().unwrap_or("");
+    let access_token_expires_at = session.access_token_expires_at.unwrap_or(0);
+
+    redis::pipe()
+        .atomic()
+        .cmd("HSET")
+        .arg(&key)
+        .arg("access_token")
+        .arg(&session.access_token)
+        .arg("refresh_token")
+        .arg(refresh_token)
+        .arg("access_token_expires_at")
+        .arg(access_token_expires_at)
+        .ignore()
+        .cmd("EXPIRE")
+        .arg(&key)
+        .arg(ttl.as_secs())
+        .ignore()
+        .query_async::<()>(&mut connection)
+        .await
+        .map_err(|_| ())
+}
+
+async fn redis_get(
+    redis: &ConnectionManager,
+    session_id: &str,
+) -> Result<Option<AuthenticatedSession>, ()> {
+    let key = session_key(session_id);
+    let mut connection = redis.clone();
+
+    let values: (Option<String>, Option<String>, Option<u64>) = redis::cmd("HMGET")
+        .arg(&key)
+        .arg("access_token")
+        .arg("refresh_token")
+        .arg("access_token_expires_at")
+        .query_async(&mut connection)
+        .await
+        .map_err(|_| ())?;
+
+    let (access_token, refresh_token, access_token_expires_at) = values;
+
+    let Some(access_token) = access_token else {
+        return Ok(None);
+    };
+
+    let refresh_token = refresh_token.filter(|token| !token.is_empty());
+
+    let access_token_expires_at = match access_token_expires_at {
+        Some(0) | None => None,
+        Some(value) => Some(value),
+    };
+
+    Ok(Some(AuthenticatedSession {
+        access_token,
+        refresh_token,
+        access_token_expires_at,
+    }))
 }
 
 pub(super) fn new_session_id() -> String {
@@ -212,10 +282,9 @@ pub(super) fn access_token_expiry(expires_in: Option<Duration>) -> Option<u64> {
     expires_at
         .duration_since(UNIX_EPOCH)
         .ok()
-        .map(|d| d.as_secs())
+        .map(|duration| duration.as_secs())
 }
 
-#[cfg(not(test))]
 fn session_key(session_id: &str) -> String {
     format!("{SESSION_KEY_PREFIX}{session_id}")
 }
@@ -267,5 +336,154 @@ mod tests {
         assert_eq!(cookie.same_site(), Some(SameSite::Strict));
         assert!(cookie.domain().is_none());
         assert_eq!(cookie.value(), "opaque-session-id");
+    }
+}
+
+#[cfg(test)]
+mod redis_integration_tests {
+    use super::*;
+
+    const TEST_TTL: Duration = Duration::from_secs(3600);
+    const SHORT_TTL_SECONDS: i64 = 30;
+
+    fn redis_manager() -> ConnectionManager {
+        let redis_url = std::env::var(REDIS_INTEGRATION_URL_ENV)
+            .expect("RTP_REDIS_INTEGRATION_URL must be set for Redis integration tests");
+
+        redis_connection_manager(&redis_url)
+            .expect("Redis integration connection manager must be created")
+    }
+
+    async fn delete_key(redis: &ConnectionManager, session_id: &str) {
+        let key = session_key(session_id);
+        let mut connection = redis.clone();
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("Redis integration test key must be deletable");
+    }
+
+    async fn ttl_seconds(redis: &ConnectionManager, session_id: &str) -> i64 {
+        let key = session_key(session_id);
+        let mut connection = redis.clone();
+
+        redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("Redis TTL must be readable")
+    }
+
+    async fn set_ttl(redis: &ConnectionManager, session_id: &str, seconds: i64) {
+        let key = session_key(session_id);
+        let mut connection = redis.clone();
+
+        let applied: bool = redis::cmd("EXPIRE")
+            .arg(key)
+            .arg(seconds)
+            .query_async(&mut connection)
+            .await
+            .expect("Redis TTL must be settable");
+
+        assert!(applied, "Redis integration test key must exist");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at RTP_REDIS_INTEGRATION_URL"]
+    async fn redis_backed_lookup_round_trips_absent_optional_fields() {
+        let redis = redis_manager();
+        let session_id = new_session_id();
+        let session = AuthenticatedSession {
+            access_token: "integration-access-token".to_owned(),
+            refresh_token: None,
+            access_token_expires_at: None,
+        };
+
+        redis_put(&redis, TEST_TTL, &session_id, &session)
+            .await
+            .expect("Redis-backed session write must succeed");
+
+        let stored = redis_get(&redis, &session_id)
+            .await
+            .expect("Redis-backed session read must succeed")
+            .expect("Redis-backed session must exist");
+
+        assert!(
+            stored == session,
+            "Redis-backed session must preserve absent optional fields"
+        );
+
+        delete_key(&redis, &session_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at RTP_REDIS_INTEGRATION_URL"]
+    async fn redis_backed_lookup_returns_none_for_unknown_key() {
+        let redis = redis_manager();
+        let session_id = new_session_id();
+
+        delete_key(&redis, &session_id).await;
+
+        let stored = redis_get(&redis, &session_id)
+            .await
+            .expect("Redis-backed lookup must succeed for an unknown key");
+
+        assert!(
+            stored.is_none(),
+            "unknown Redis session key must resolve to None"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at RTP_REDIS_INTEGRATION_URL"]
+    async fn redis_backed_lookup_does_not_extend_ttl() {
+        let redis = redis_manager();
+        let session_id = new_session_id();
+        let session = AuthenticatedSession {
+            access_token: "integration-access-token".to_owned(),
+            refresh_token: Some("integration-refresh-token".to_owned()),
+            access_token_expires_at: Some(12345),
+        };
+
+        redis_put(&redis, TEST_TTL, &session_id, &session)
+            .await
+            .expect("Redis-backed session write must succeed");
+
+        set_ttl(&redis, &session_id, SHORT_TTL_SECONDS).await;
+
+        let ttl_before = ttl_seconds(&redis, &session_id).await;
+        assert!(
+            ttl_before > 0 && ttl_before <= SHORT_TTL_SECONDS,
+            "precondition: Redis key must have the shortened TTL"
+        );
+
+        let stored = redis_get(&redis, &session_id)
+            .await
+            .expect("Redis-backed session read must succeed")
+            .expect("Redis-backed session must exist");
+
+        assert!(
+            stored == session,
+            "Redis-backed session must remain readable"
+        );
+
+        let ttl_after = ttl_seconds(&redis, &session_id).await;
+
+        assert!(
+            ttl_after > 0,
+            "session key must remain alive during the lookup"
+        );
+        assert!(
+            ttl_after <= ttl_before,
+            "session lookup must not extend the Redis TTL"
+        );
+        assert!(
+            ttl_after < TEST_TTL.as_secs() as i64,
+            "session lookup must not reset the Redis TTL to the configured session TTL"
+        );
+
+        delete_key(&redis, &session_id).await;
     }
 }

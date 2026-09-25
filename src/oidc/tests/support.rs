@@ -21,7 +21,7 @@ pub(super) use axum::{
     extract::{ConnectInfo, Query, State},
     http::{
         HeaderMap, HeaderValue, Request, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
     },
     response::IntoResponse,
     routing::{get, post},
@@ -43,12 +43,12 @@ pub(super) use time::Duration as CookieDuration;
 pub(super) use tokio::sync::{Barrier, Mutex as AsyncMutex};
 pub(super) use tower::ServiceExt;
 
-pub(super) use crate::session::{SessionStore, session_cookie_name};
+pub(super) use crate::session::{AuthenticatedSession, SessionStore, session_cookie_name};
 
 pub(super) use super::super::{
     LOGIN_BURST, LOGIN_REQUESTS_PER_MINUTE, OidcState,
     config::{CLIENT_ID, ISSUER, LOCAL_REDIRECT_URI, OidcConfig, validate_redirect_uri},
-    handlers::{callback, extract_client_ip, login},
+    handlers::{callback, check_session, extract_client_ip, login},
     provider::{build_http_client, verify_id_token_with_single_refresh},
     transaction::{
         AuthorizationTransaction, BROWSER_BINDING_BYTES, LOGIN_TTL, LOGIN_TTL_SECONDS,
