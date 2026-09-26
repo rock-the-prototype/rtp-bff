@@ -1,11 +1,16 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    future::Future,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use openidconnect::{
     AuthType, ClientId, OAuth2TokenResponse, RefreshToken, RequestTokenError,
     core::{CoreClient, CoreErrorResponseType, CoreProviderMetadata},
 };
 
-use crate::session::{AuthenticatedSession, RefreshOwnedMutation, new_refresh_owner_id};
+use crate::session::{
+    AuthenticatedSession, RefreshOwnedMutation, SessionStore, new_refresh_owner_id,
+};
 
 use super::{
     OidcState,
@@ -188,22 +193,10 @@ async fn refresh_with_ownership(
     operation_started_at: &tokio::time::Instant,
     owner_deadline: tokio::time::Instant,
 ) -> AccessTokenResolution {
-    // The absolute deadline was created before the Redis acquisition attempt.
-    // If the successful lock response was delayed until after that deadline,
-    // do not start owner work at all. Release what is still ours and fail closed.
-    if owner_deadline_has_elapsed(owner_deadline, tokio::time::Instant::now()) {
-        return release_refresh_lock(
-            state,
-            session_id,
-            owner_id,
-            AccessTokenResolution::TemporarilyUnavailable,
-        )
-        .await;
-    }
-
-    // Bound the complete post-acquisition critical section by the absolute
-    // deadline that already includes Redis acquisition/response delay.
-    let result = match tokio::time::timeout_at(
+    run_owned_refresh(
+        &state.session_store,
+        session_id,
+        owner_id,
         owner_deadline,
         refresh_with_ownership_inner(
             state,
@@ -215,7 +208,34 @@ async fn refresh_with_ownership(
         ),
     )
     .await
-    {
+}
+
+async fn run_owned_refresh<F>(
+    session_store: &SessionStore,
+    session_id: &str,
+    owner_id: &str,
+    owner_deadline: tokio::time::Instant,
+    owner_work: F,
+) -> AccessTokenResolution
+where
+    F: Future<Output = AccessTokenResolution>,
+{
+    // The absolute deadline was created before the Redis acquisition attempt.
+    // If the successful lock response was delayed until after that deadline,
+    // do not start owner work at all. Release what is still ours and fail closed.
+    if owner_deadline_has_elapsed(owner_deadline, tokio::time::Instant::now()) {
+        return release_refresh_lock(
+            session_store,
+            session_id,
+            owner_id,
+            AccessTokenResolution::TemporarilyUnavailable,
+        )
+        .await;
+    }
+
+    // Bound the complete post-acquisition critical section by the absolute
+    // deadline that already includes Redis acquisition/response delay.
+    let result = match tokio::time::timeout_at(owner_deadline, owner_work).await {
         Ok(result) => result,
         Err(_) => AccessTokenResolution::TemporarilyUnavailable,
     };
@@ -223,17 +243,16 @@ async fn refresh_with_ownership(
     // Because the owner deadline started before lease acquisition and is
     // strictly shorter than REFRESH_LOCK_LEASE, the configured lease margin is
     // reserved for cancellation/cleanup and ownership-safe release.
-    release_refresh_lock(state, session_id, owner_id, result).await
+    release_refresh_lock(session_store, session_id, owner_id, result).await
 }
 
 async fn release_refresh_lock(
-    state: &OidcState,
+    session_store: &SessionStore,
     session_id: &str,
     owner_id: &str,
     result: AccessTokenResolution,
 ) -> AccessTokenResolution {
-    match state
-        .session_store
+    match session_store
         .release_refresh_lock(session_id, owner_id)
         .await
     {
@@ -422,6 +441,66 @@ mod timing_tests {
         assert!(
             owner_deadline_has_elapsed(owner_deadline, owner_work_after_deadline),
             "delay between the acquisition attempt and owner work must consume the owner budget"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn owner_timeout_fails_closed_and_releases_refresh_lock() {
+        let store = SessionStore::for_tests();
+        let session_id = "owner-timeout-session";
+        let owner_a = new_refresh_owner_id();
+        let owner_b = new_refresh_owner_id();
+
+        assert!(
+            store
+                .try_acquire_refresh_lock(session_id, &owner_a, REFRESH_LOCK_LEASE,)
+                .await
+                .expect("first refresh owner must acquire the lock")
+        );
+
+        let owner_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        let store_for_task = store.clone();
+        let owner_a_for_task = owner_a.clone();
+
+        let owner_task = tokio::spawn(async move {
+            run_owned_refresh(
+                &store_for_task,
+                session_id,
+                &owner_a_for_task,
+                owner_deadline,
+                std::future::pending::<AccessTokenResolution>(),
+            )
+            .await
+        });
+
+        // Ensure the owned operation has been polled and is waiting on its
+        // deadline, then deterministically advance Tokio's paused clock.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let result = owner_task
+            .await
+            .expect("timed-out refresh-owner task must complete");
+
+        assert!(matches!(
+            result,
+            AccessTokenResolution::TemporarilyUnavailable
+        ));
+
+        assert!(
+            store
+                .try_acquire_refresh_lock(session_id, &owner_b, Duration::from_secs(5),)
+                .await
+                .expect("replacement owner acquisition must succeed"),
+            "owner timeout must release the previous ownership-safe refresh lock"
+        );
+
+        assert!(
+            store
+                .release_refresh_lock(session_id, &owner_b)
+                .await
+                .expect("replacement owner lock release must succeed")
         );
     }
 
