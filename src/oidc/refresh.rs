@@ -117,6 +117,14 @@ pub(super) async fn resolve_access_token_at(
             return AccessTokenResolution::TemporarilyUnavailable;
         }
 
+        // Start the owner budget before asking Redis for the lease. Redis begins
+        // the lease when SET NX PX executes, while the client may observe the
+        // successful response later. Starting our absolute deadline before the
+        // acquisition attempt is conservative: any Redis/network/task delay
+        // consumes owner budget instead of creating work time after lease expiry.
+        let acquisition_attempt_started_at = tokio::time::Instant::now();
+        let owner_deadline = refresh_owner_deadline(acquisition_attempt_started_at);
+
         match state
             .session_store
             .try_acquire_refresh_lock(session_id, &owner_id, REFRESH_LOCK_LEASE)
@@ -130,6 +138,7 @@ pub(super) async fn resolve_access_token_at(
                     &metadata,
                     now,
                     &operation_started_at,
+                    owner_deadline,
                 )
                 .await;
             }
@@ -177,11 +186,25 @@ async fn refresh_with_ownership(
     metadata: &CoreProviderMetadata,
     base_now: u64,
     operation_started_at: &tokio::time::Instant,
+    owner_deadline: tokio::time::Instant,
 ) -> AccessTokenResolution {
-    // Hard end-to-end deadline for the complete critical section protected by
-    // the Redis lease. This is strictly shorter than REFRESH_LOCK_LEASE.
-    let result = match tokio::time::timeout(
-        REFRESH_OWNER_OPERATION_TIMEOUT,
+    // The absolute deadline was created before the Redis acquisition attempt.
+    // If the successful lock response was delayed until after that deadline,
+    // do not start owner work at all. Release what is still ours and fail closed.
+    if owner_deadline_has_elapsed(owner_deadline, tokio::time::Instant::now()) {
+        return release_refresh_lock(
+            state,
+            session_id,
+            owner_id,
+            AccessTokenResolution::TemporarilyUnavailable,
+        )
+        .await;
+    }
+
+    // Bound the complete post-acquisition critical section by the absolute
+    // deadline that already includes Redis acquisition/response delay.
+    let result = match tokio::time::timeout_at(
+        owner_deadline,
         refresh_with_ownership_inner(
             state,
             session_id,
@@ -197,8 +220,18 @@ async fn refresh_with_ownership(
         Err(_) => AccessTokenResolution::TemporarilyUnavailable,
     };
 
-    // Lock release happens outside the owner-operation timeout, while the lease
-    // still has REFRESH_LOCK_MARGIN_SECONDS of headroom.
+    // Because the owner deadline started before lease acquisition and is
+    // strictly shorter than REFRESH_LOCK_LEASE, the configured lease margin is
+    // reserved for cancellation/cleanup and ownership-safe release.
+    release_refresh_lock(state, session_id, owner_id, result).await
+}
+
+async fn release_refresh_lock(
+    state: &OidcState,
+    session_id: &str,
+    owner_id: &str,
+    result: AccessTokenResolution,
+) -> AccessTokenResolution {
     match state
         .session_store
         .release_refresh_lock(session_id, owner_id)
@@ -322,6 +355,19 @@ fn refreshed_access_token_expiry(now: u64, expires_in: Option<Duration>) -> Opti
     now.checked_add(expires_in?.as_secs())
 }
 
+fn refresh_owner_deadline(
+    acquisition_attempt_started_at: tokio::time::Instant,
+) -> tokio::time::Instant {
+    acquisition_attempt_started_at + REFRESH_OWNER_OPERATION_TIMEOUT
+}
+
+fn owner_deadline_has_elapsed(
+    owner_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> bool {
+    now >= owner_deadline
+}
+
 fn effective_now(base_now: u64, operation_started_at: &tokio::time::Instant) -> u64 {
     effective_now_from_elapsed(base_now, operation_started_at.elapsed())
 }
@@ -354,6 +400,28 @@ mod timing_tests {
         assert!(
             REFRESH_WAIT_TIMEOUT > REFRESH_LOCK_LEASE,
             "a healthy waiter must tolerate the complete refresh-owner lease"
+        );
+    }
+
+    #[test]
+    fn delay_after_acquisition_attempt_consumes_owner_budget() {
+        let acquisition_attempt_started_at = tokio::time::Instant::now();
+        let owner_deadline = refresh_owner_deadline(acquisition_attempt_started_at);
+
+        let owner_work_before_deadline = acquisition_attempt_started_at
+            + REFRESH_OWNER_OPERATION_TIMEOUT
+            - Duration::from_millis(1);
+        let owner_work_after_deadline = acquisition_attempt_started_at
+            + REFRESH_OWNER_OPERATION_TIMEOUT
+            + Duration::from_millis(1);
+
+        assert!(
+            !owner_deadline_has_elapsed(owner_deadline, owner_work_before_deadline),
+            "owner work may proceed while the pre-acquisition deadline is still live"
+        );
+        assert!(
+            owner_deadline_has_elapsed(owner_deadline, owner_work_after_deadline),
+            "delay between the acquisition attempt and owner work must consume the owner budget"
         );
     }
 
