@@ -98,7 +98,6 @@ async fn valid_access_token_is_reused_without_refresh() {
     assert_ready_token(resolution, &access_token);
     assert_eq!(endpoint.calls.load(Ordering::SeqCst), 0);
 }
-
 #[tokio::test]
 async fn expiring_access_token_is_refreshed_and_persisted() {
     let session_id = runtime_secret();
@@ -118,7 +117,11 @@ async fn expiring_access_token_is_refreshed_and_persisted() {
     )
     .await;
 
+    let refresh_started_at = std::time::Instant::now();
+
     let resolution = resolve_access_token_at(&state, &session_id, TEST_NOW).await;
+
+    let refresh_elapsed = refresh_started_at.elapsed();
 
     assert_ready_token(resolution, &endpoint.access_token);
     assert_eq!(endpoint.calls.load(Ordering::SeqCst), 1);
@@ -139,7 +142,18 @@ async fn expiring_access_token_is_refreshed_and_persisted() {
 
     assert_eq!(stored.access_token, endpoint.access_token);
     assert_eq!(stored.refresh_token, endpoint.rotated_refresh_token);
-    assert_eq!(stored.access_token_expires_at, Some(TEST_NOW + 300));
+    let stored_expiry = stored
+        .access_token_expires_at
+        .expect("refreshed access token must have an expiry");
+
+    let minimum_expiry = TEST_NOW + 300;
+    let maximum_expiry = minimum_expiry.saturating_add(refresh_elapsed.as_secs());
+
+    assert!(
+        (minimum_expiry..=maximum_expiry).contains(&stored_expiry),
+        "refreshed access-token expiry {stored_expiry} must include measurable \
+     elapsed time and remain within [{minimum_expiry}, {maximum_expiry}]"
+    );
 }
 
 #[tokio::test]
@@ -533,4 +547,42 @@ async fn no_browser_refresh_route_exists() {
         .expect("OIDC router must answer the request");
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+#[tokio::test]
+async fn refreshed_token_expiry_includes_elapsed_refresh_time() {
+    let refresh_token = runtime_secret();
+
+    let (state, endpoint) = state_with_refresh_endpoint(
+        refresh_token.clone(),
+        MockRefreshOutcome::SuccessWithRotation,
+        Duration::from_millis(1_100),
+    )
+    .await;
+
+    let session_id = runtime_secret();
+
+    put_session(
+        &state,
+        &session_id,
+        runtime_secret(),
+        Some(refresh_token),
+        Some(TEST_NOW),
+    )
+    .await;
+
+    let resolution = resolve_access_token_at(&state, &session_id, TEST_NOW).await;
+
+    assert_ready_token(resolution, &endpoint.access_token);
+
+    let stored = state
+        .session_store
+        .get(&session_id)
+        .await
+        .expect("session read must succeed")
+        .expect("refreshed session must remain present");
+
+    assert!(
+        stored.access_token_expires_at >= Some(TEST_NOW + 301),
+        "token expiry must include measurable elapsed refresh time"
+    );
 }

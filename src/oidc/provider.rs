@@ -13,7 +13,8 @@ use super::{
 };
 
 const OIDC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(super) const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) fn build_http_client() -> reqwest::Client {
     reqwest::ClientBuilder::new()
