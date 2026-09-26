@@ -12,6 +12,7 @@ use tokio::sync::Mutex as AsyncMutex;
 mod config;
 mod handlers;
 mod provider;
+mod refresh;
 mod transaction;
 
 use crate::session::SessionStore;
