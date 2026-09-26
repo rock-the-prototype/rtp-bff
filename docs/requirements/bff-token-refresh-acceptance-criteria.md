@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-26
-- **Requirements:** `bff-token-refresh-acceptance-criteria.md`
+- **Requirements:** `docs/requirements/bff-token-refresh-requirements.md`
 - **Decision:** `docs/decisions/ADR-0005-server-side-oauth-token-refresh-lifecycle.md`
 
 ## Acceptance criteria
