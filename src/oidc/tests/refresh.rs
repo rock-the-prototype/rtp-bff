@@ -534,3 +534,41 @@ async fn no_browser_refresh_route_exists() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+#[tokio::test]
+async fn refreshed_token_expiry_includes_elapsed_refresh_time() {
+    let refresh_token = runtime_secret();
+
+    let (state, endpoint) = state_with_refresh_endpoint(
+        refresh_token.clone(),
+        MockRefreshOutcome::SuccessWithRotation,
+        Duration::from_millis(1_100),
+    )
+    .await;
+
+    let session_id = runtime_secret();
+
+    put_session(
+        &state,
+        &session_id,
+        runtime_secret(),
+        Some(refresh_token),
+        Some(TEST_NOW),
+    )
+    .await;
+
+    let resolution = resolve_access_token_at(&state, &session_id, TEST_NOW).await;
+
+    assert_ready_token(resolution, &endpoint.access_token);
+
+    let stored = state
+        .session_store
+        .get(&session_id)
+        .await
+        .expect("session read must succeed")
+        .expect("refreshed session must remain present");
+
+    assert!(
+        stored.access_token_expires_at >= Some(TEST_NOW + 301),
+        "token expiry must include measurable elapsed refresh time"
+    );
+}
