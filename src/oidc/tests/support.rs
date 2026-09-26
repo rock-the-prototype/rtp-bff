@@ -50,6 +50,8 @@ pub(super) use super::super::{
     config::{CLIENT_ID, ISSUER, LOCAL_REDIRECT_URI, OidcConfig, validate_redirect_uri},
     handlers::{callback, check_session, extract_client_ip, login},
     provider::{build_http_client, verify_id_token_with_single_refresh},
+    refresh::{AccessTokenResolution, resolve_access_token, resolve_access_token_at},
+    router as oidc_router,
     transaction::{
         AuthorizationTransaction, BROWSER_BINDING_BYTES, LOGIN_TTL, LOGIN_TTL_SECONDS,
         PREAUTH_COOKIE_PATH, build_preauth_cookie, hash_browser_binding, preauth_cookie_name,
@@ -446,6 +448,170 @@ pub(super) async fn spawn_mock_token_endpoint(
     MockTokenEndpoint {
         url: format!("http://{address}/token"),
         calls,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum MockRefreshOutcome {
+    SuccessWithRotation,
+    SuccessWithoutRotation,
+    InvalidGrant,
+    TemporaryFailure,
+}
+
+pub(super) struct MockRefreshTokenEndpoint {
+    pub(super) url: String,
+    pub(super) calls: Arc<AtomicUsize>,
+    pub(super) client_auth_failures: Arc<AtomicUsize>,
+    pub(super) client_secret_body_violations: Arc<AtomicUsize>,
+    pub(super) access_token: String,
+    pub(super) rotated_refresh_token: Option<String>,
+}
+
+pub(super) async fn spawn_mock_refresh_token_endpoint(
+    expected_refresh_token: String,
+    expected_client_secret: String,
+    outcome: MockRefreshOutcome,
+    delay: Duration,
+) -> MockRefreshTokenEndpoint {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client_auth_failures = Arc::new(AtomicUsize::new(0));
+    let client_secret_body_violations = Arc::new(AtomicUsize::new(0));
+    let access_token = runtime_secret();
+    let rotated_refresh_token = match outcome {
+        MockRefreshOutcome::SuccessWithRotation => Some(runtime_secret()),
+        MockRefreshOutcome::SuccessWithoutRotation
+        | MockRefreshOutcome::InvalidGrant
+        | MockRefreshOutcome::TemporaryFailure => None,
+    };
+
+    let handler_calls = calls.clone();
+    let handler_client_auth_failures = client_auth_failures.clone();
+    let handler_client_secret_body_violations = client_secret_body_violations.clone();
+    let handler_access_token = access_token.clone();
+    let handler_rotated_refresh_token = rotated_refresh_token.clone();
+    let expected_refresh_token = Arc::new(expected_refresh_token);
+    let expected_client_secret = Arc::new(expected_client_secret);
+
+    let app = Router::new().route(
+        "/token",
+        post(move |headers: HeaderMap, body: String| {
+            let calls = handler_calls.clone();
+            let client_auth_failures = handler_client_auth_failures.clone();
+            let client_secret_body_violations = handler_client_secret_body_violations.clone();
+            let access_token = handler_access_token.clone();
+            let rotated_refresh_token = handler_rotated_refresh_token.clone();
+            let expected_refresh_token = expected_refresh_token.clone();
+            let expected_client_secret = expected_client_secret.clone();
+
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+
+                if form_value(&body, "client_secret").is_some() {
+                    client_secret_body_violations.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"error":"invalid_client"}"#.to_owned(),
+                    )
+                        .into_response();
+                }
+
+                if !request_uses_expected_basic_auth(
+                    &headers,
+                    CLIENT_ID,
+                    expected_client_secret.as_str(),
+                ) {
+                    client_auth_failures.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"error":"invalid_client"}"#.to_owned(),
+                    )
+                        .into_response();
+                }
+
+                let grant_type_matches =
+                    form_value(&body, "grant_type") == Some("refresh_token");
+                let refresh_token_matches = form_value(&body, "refresh_token")
+                    == Some(expected_refresh_token.as_str());
+
+                if !grant_type_matches || !refresh_token_matches {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"error":"invalid_grant"}"#.to_owned(),
+                    )
+                        .into_response();
+                }
+
+                match outcome {
+                    MockRefreshOutcome::SuccessWithRotation => {
+                        let refresh_token = rotated_refresh_token
+                            .as_deref()
+                            .expect("rotating mock response must contain a refresh token");
+                        let response = format!(
+                            r#"{{"access_token":"{access_token}","refresh_token":"{refresh_token}","token_type":"Bearer","expires_in":300}}"#
+                        );
+                        (
+                            StatusCode::OK,
+                            [(CONTENT_TYPE, "application/json")],
+                            response,
+                        )
+                            .into_response()
+                    }
+                    MockRefreshOutcome::SuccessWithoutRotation => {
+                        let response = format!(
+                            r#"{{"access_token":"{access_token}","token_type":"Bearer","expires_in":300}}"#
+                        );
+                        (
+                            StatusCode::OK,
+                            [(CONTENT_TYPE, "application/json")],
+                            response,
+                        )
+                            .into_response()
+                    }
+                    MockRefreshOutcome::InvalidGrant => (
+                        StatusCode::BAD_REQUEST,
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"error":"invalid_grant"}"#.to_owned(),
+                    )
+                        .into_response(),
+                    MockRefreshOutcome::TemporaryFailure => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"error":"temporarily_unavailable"}"#.to_owned(),
+                    )
+                        .into_response(),
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock refresh token endpoint must bind");
+    let address = listener
+        .local_addr()
+        .expect("mock refresh token endpoint must have an address");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock refresh token endpoint must run");
+    });
+
+    MockRefreshTokenEndpoint {
+        url: format!("http://{address}/token"),
+        calls,
+        client_auth_failures,
+        client_secret_body_violations,
+        access_token,
+        rotated_refresh_token,
     }
 }
 
