@@ -9,7 +9,6 @@ const MAX_ROUTE_ID_LEN: usize = 128;
 const MAX_PARAMETER_NAME_LEN: usize = 64;
 const MAX_HEADER_NAME_LEN: usize = 128;
 const MAX_HOST_LEN: usize = 253;
-
 const FORBIDDEN_REQUEST_FORWARD_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -31,7 +30,6 @@ const FORBIDDEN_RESPONSE_FORWARD_HEADERS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathConstraint {
     Uuid,
@@ -51,7 +49,6 @@ pub struct UpstreamRouteDefinition {
     pub path_template: String,
     pub follow_redirects: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRoutePolicyDefinition {
     pub id: String,
@@ -63,7 +60,6 @@ pub struct ResourceRoutePolicyDefinition {
     pub request_headers_to_forward: Vec<String>,
     pub response_headers_to_forward: Vec<String>,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovedOrigin {
     scheme: String,
@@ -87,7 +83,6 @@ impl ApprovedOrigin {
         self.port
     }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedResourceRoute {
     route_id: String,
@@ -108,7 +103,6 @@ impl ResolvedResourceRoute {
     pub fn method(&self) -> &str {
         &self.method
     }
-
     #[must_use]
     pub fn origin(&self) -> &ApprovedOrigin {
         &self.origin
@@ -129,13 +123,11 @@ impl ResolvedResourceRoute {
         &self.response_headers_to_forward
     }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TemplateSegment {
     Static(String),
     Parameter(String),
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedRoutePolicy {
     id: String,
@@ -149,7 +141,6 @@ struct ValidatedRoutePolicy {
     request_headers_to_forward: BTreeSet<String>,
     response_headers_to_forward: BTreeSet<String>,
 }
-
 #[derive(Debug, Clone)]
 pub struct RoutePolicySnapshot {
     version: String,
@@ -166,7 +157,6 @@ impl RoutePolicySnapshot {
         if version.trim().is_empty() {
             return Err(RoutePolicyError::EmptyVersion);
         }
-
         let mut routes = BTreeMap::new();
         let mut browser_bindings = BTreeMap::<(String, String), String>::new();
 
@@ -176,7 +166,6 @@ impl RoutePolicySnapshot {
             if routes.contains_key(&validated.id) {
                 return Err(RoutePolicyError::DuplicateRouteId(validated.id));
             }
-
             for method in &validated.methods {
                 let key = (validated.browser_path_shape.clone(), method.clone());
                 if let Some(existing_route) =
@@ -190,7 +179,6 @@ impl RoutePolicySnapshot {
                     });
                 }
             }
-
             routes.insert(validated.id.clone(), validated);
         }
 
@@ -216,7 +204,6 @@ impl RoutePolicySnapshot {
     pub fn route_count(&self) -> usize {
         self.routes.len()
     }
-
     pub fn resolve(
         &self,
         route_id: &str,
@@ -228,7 +215,6 @@ impl RoutePolicySnapshot {
             .routes
             .get(route_id)
             .ok_or_else(|| RoutePolicyError::UnknownRoute(route_id.to_owned()))?;
-
         let method = method.to_ascii_uppercase();
         if !route.methods.contains(&method) {
             return Err(RoutePolicyError::MethodNotAllowed {
@@ -239,7 +225,6 @@ impl RoutePolicySnapshot {
 
         let provided_path = collect_unique_parameters(path_parameters, ParameterKind::Path)?;
         let path = resolve_path(route, &provided_path)?;
-
         let provided_query = collect_unique_parameters(query_parameters, ParameterKind::Query)?;
         let query = resolve_query(route, &provided_query)?;
 
@@ -248,7 +233,6 @@ impl RoutePolicySnapshot {
         } else {
             format!("{path}?{query}")
         };
-
         Ok(ResolvedResourceRoute {
             route_id: route.id.clone(),
             method,
@@ -259,7 +243,6 @@ impl RoutePolicySnapshot {
         })
     }
 }
-
 #[derive(Clone)]
 pub struct ResourceRoutePolicyRegistry {
     active: Arc<RwLock<Arc<RoutePolicySnapshot>>>,
@@ -272,7 +255,6 @@ impl ResourceRoutePolicyRegistry {
             active: Arc::new(RwLock::new(Arc::new(snapshot))),
         }
     }
-
     pub fn active_snapshot(&self) -> Result<Arc<RoutePolicySnapshot>, RoutePolicyError> {
         let guard = self
             .active
@@ -280,7 +262,6 @@ impl ResourceRoutePolicyRegistry {
             .map_err(|_| RoutePolicyError::PolicyRegistryUnavailable)?;
         Ok(Arc::clone(&guard))
     }
-
     pub fn resolve(
         &self,
         route_id: &str,
@@ -291,7 +272,6 @@ impl ResourceRoutePolicyRegistry {
         self.active_snapshot()?
             .resolve(route_id, method, path_parameters, query_parameters)
     }
-
     pub fn activate_candidate(
         &self,
         version: impl Into<String>,
@@ -301,7 +281,6 @@ impl ResourceRoutePolicyRegistry {
         // candidate therefore cannot partially modify the active snapshot.
         let candidate = Arc::new(RoutePolicySnapshot::try_new(version, definitions)?);
         let digest = candidate.digest().to_owned();
-
         let mut guard = self
             .active
             .write()
@@ -311,7 +290,6 @@ impl ResourceRoutePolicyRegistry {
         Ok(digest)
     }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutePolicyError {
     EmptyVersion,
@@ -352,7 +330,6 @@ pub enum RoutePolicyError {
     InvalidQueryParameter(String),
     PolicyRegistryUnavailable,
 }
-
 impl fmt::Display for RoutePolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -406,9 +383,7 @@ impl fmt::Display for RoutePolicyError {
         }
     }
 }
-
 impl std::error::Error for RoutePolicyError {}
-
 #[derive(Clone, Copy)]
 enum ParameterKind {
     Path,
@@ -423,7 +398,6 @@ fn validate_route(
     if definition.methods.is_empty() {
         return Err(RoutePolicyError::EmptyMethodSet(definition.id));
     }
-
     let mut methods = BTreeSet::new();
     for method in definition.methods {
         let method = method.to_ascii_uppercase();
@@ -436,7 +410,6 @@ fn validate_route(
     let (browser_path, browser_path_shape) =
         validate_browser_path(&definition.browser_path, &definition.path_parameters)?;
     let origin = validate_origin(&definition.upstream)?;
-
     if definition.upstream.follow_redirects {
         return Err(RoutePolicyError::RedirectFollowingForbidden(definition.id));
     }
@@ -448,7 +421,6 @@ fn validate_route(
     )?;
 
     validate_query_constraints(&definition.query_parameters)?;
-
     let request_headers_to_forward = validate_header_allowlist(
         definition.request_headers_to_forward,
         FORBIDDEN_REQUEST_FORWARD_HEADERS,
@@ -459,7 +431,6 @@ fn validate_route(
         FORBIDDEN_RESPONSE_FORWARD_HEADERS,
         false,
     )?;
-
     Ok(ValidatedRoutePolicy {
         id: definition.id,
         browser_path,
@@ -473,7 +444,6 @@ fn validate_route(
         response_headers_to_forward,
     })
 }
-
 fn validate_route_id(id: &str) -> Result<(), RoutePolicyError> {
     if id.is_empty()
         || id.len() > MAX_ROUTE_ID_LEN
@@ -485,7 +455,6 @@ fn validate_route_id(id: &str) -> Result<(), RoutePolicyError> {
     }
     Ok(())
 }
-
 fn validate_browser_path(
     path: &str,
     constraints: &BTreeMap<String, PathConstraint>,
@@ -496,7 +465,6 @@ fn validate_browser_path(
         }
         other => other,
     })?;
-
     let mut shape = String::new();
     for segment in segments {
         shape.push('/');
@@ -508,7 +476,6 @@ fn validate_browser_path(
 
     Ok((path.to_owned(), shape))
 }
-
 fn validate_origin(upstream: &UpstreamRouteDefinition) -> Result<ApprovedOrigin, RoutePolicyError> {
     if !upstream.scheme.eq_ignore_ascii_case("https") {
         return Err(RoutePolicyError::UnsupportedScheme(upstream.scheme.clone()));
@@ -521,7 +488,6 @@ fn validate_origin(upstream: &UpstreamRouteDefinition) -> Result<ApprovedOrigin,
     if upstream.port == 0 {
         return Err(RoutePolicyError::InvalidPort(upstream.port));
     }
-
     Ok(ApprovedOrigin {
         scheme: "https".to_owned(),
         host: upstream.host.to_ascii_lowercase(),
@@ -533,7 +499,6 @@ fn is_valid_logical_host(host: &str) -> bool {
     if host.is_empty() || host.len() > MAX_HOST_LEN || host.ends_with('.') {
         return false;
     }
-
     host.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
@@ -544,7 +509,6 @@ fn is_valid_logical_host(host: &str) -> bool {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     })
 }
-
 fn parse_path_template(
     template: &str,
     constraints: &BTreeMap<String, PathConstraint>,
@@ -559,8 +523,10 @@ fn parse_path_template(
     {
         return Err(RoutePolicyError::InvalidPathTemplate(template.to_owned()));
     }
-
     if template == "/" {
+        if browser_path {
+            return Err(RoutePolicyError::InvalidBrowserPath(template.to_owned()));
+        }
         if constraints.is_empty() {
             return Ok(Vec::new());
         }
@@ -571,12 +537,10 @@ fn parse_path_template(
 
     let mut segments = Vec::new();
     let mut used_parameters = BTreeSet::new();
-
     for segment in template[1..].split('/') {
         if segment.is_empty() || segment == "." || segment == ".." {
             return Err(RoutePolicyError::InvalidPathTemplate(template.to_owned()));
         }
-
         if let Some(name) = parse_parameter_segment(segment) {
             validate_parameter_name(name)?;
             if !constraints.contains_key(name) {
@@ -588,7 +552,6 @@ fn parse_path_template(
             segments.push(TemplateSegment::Parameter(name.to_owned()));
             continue;
         }
-
         if segment.contains('{') || segment.contains('}') || !segment.bytes().all(is_unreserved) {
             return Err(RoutePolicyError::InvalidPathTemplate(template.to_owned()));
         }
@@ -601,7 +564,6 @@ fn parse_path_template(
             return Err(RoutePolicyError::UnusedPathConstraint(parameter.clone()));
         }
     }
-
     if browser_path && segments.is_empty() {
         return Err(RoutePolicyError::InvalidBrowserPath(template.to_owned()));
     }
@@ -615,7 +577,6 @@ fn parse_parameter_segment(segment: &str) -> Option<&str> {
         .and_then(|value| value.strip_suffix('}'))
         .filter(|value| !value.contains('{') && !value.contains('}'))
 }
-
 fn validate_parameter_name(name: &str) -> Result<(), RoutePolicyError> {
     let mut bytes = name.bytes();
     let Some(first) = bytes.next() else {
@@ -628,7 +589,6 @@ fn validate_parameter_name(name: &str) -> Result<(), RoutePolicyError> {
     {
         return Err(RoutePolicyError::InvalidParameterName(name.to_owned()));
     }
-
     Ok(())
 }
 
@@ -643,7 +603,6 @@ fn validate_query_constraints(
     }
     Ok(())
 }
-
 fn validate_header_allowlist(
     headers: Vec<String>,
     forbidden: &[&str],
@@ -659,7 +618,6 @@ fn validate_header_allowlist(
         {
             return Err(RoutePolicyError::InvalidHeaderName(header));
         }
-
         if forbidden.contains(&normalized.as_str()) {
             return if request {
                 Err(RoutePolicyError::ForbiddenRequestForwardHeader(normalized))
@@ -673,7 +631,6 @@ fn validate_header_allowlist(
 
     Ok(validated)
 }
-
 fn collect_unique_parameters<'a>(
     parameters: &[(&'a str, &'a str)],
     kind: ParameterKind,
@@ -693,7 +650,6 @@ fn collect_unique_parameters<'a>(
     }
     Ok(collected)
 }
-
 fn resolve_path(
     route: &ValidatedRoutePolicy,
     provided: &BTreeMap<&str, &str>,
@@ -708,12 +664,10 @@ fn resolve_path(
 
     let mut resolved = String::new();
     resolved.push('/');
-
     for (index, segment) in route.upstream_path.iter().enumerate() {
         if index > 0 {
             resolved.push('/');
         }
-
         match segment {
             TemplateSegment::Static(value) => resolved.push_str(value),
             TemplateSegment::Parameter(name) => {
@@ -731,7 +685,6 @@ fn resolve_path(
             }
         }
     }
-
     Ok(resolved)
 }
 
@@ -746,7 +699,6 @@ fn resolve_query(
             .query_parameters
             .get(*name)
             .ok_or_else(|| RoutePolicyError::QueryParameterNotAllowed((*name).to_owned()))?;
-
         if !query_value_matches(constraint, value) {
             return Err(RoutePolicyError::InvalidQueryParameter((*name).to_owned()));
         }
@@ -767,7 +719,6 @@ fn path_value_matches(constraint: &PathConstraint, value: &str) -> bool {
         PathConstraint::Uuid => is_canonical_uuid(value),
     }
 }
-
 fn query_value_matches(constraint: &QueryConstraint, value: &str) -> bool {
     match constraint {
         QueryConstraint::Uuid => is_canonical_uuid(value),
@@ -781,7 +732,6 @@ fn is_canonical_uuid(value: &str) -> bool {
     if value.len() != 36 {
         return false;
     }
-
     value.bytes().enumerate().all(|(index, byte)| match index {
         8 | 13 | 18 | 23 => byte == b'-',
         _ => byte.is_ascii_hexdigit(),
@@ -791,7 +741,6 @@ fn is_canonical_uuid(value: &str) -> bool {
 fn is_unreserved(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
-
 fn is_http_token_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
@@ -812,11 +761,11 @@ fn is_http_token_char(byte: u8) -> bool {
                 | b'~'
         )
 }
-
 fn policy_digest(version: &str, routes: &BTreeMap<String, ValidatedRoutePolicy>) -> String {
     let mut canonical = String::new();
+    writeln!(&mut canonical, "version-length={}", version.len())
+        .expect("writing to String cannot fail");
     writeln!(&mut canonical, "version={version}").expect("writing to String cannot fail");
-
     for route in routes.values() {
         writeln!(&mut canonical, "route={}", route.id).expect("writing to String cannot fail");
         writeln!(&mut canonical, "browser={}", route.browser_path)
@@ -839,7 +788,6 @@ fn policy_digest(version: &str, routes: &BTreeMap<String, ValidatedRoutePolicy>)
             render_template(&route.upstream_path)
         )
         .expect("writing to String cannot fail");
-
         for (name, constraint) in &route.path_parameters {
             writeln!(
                 &mut canonical,
@@ -879,7 +827,6 @@ fn policy_digest(version: &str, routes: &BTreeMap<String, ValidatedRoutePolicy>)
         )
         .expect("writing to String cannot fail");
     }
-
     let digest = Sha256::digest(canonical.as_bytes());
     let mut encoded = String::with_capacity(7 + digest.len() * 2);
     encoded.push_str("sha256:");
@@ -893,7 +840,6 @@ fn render_template(segments: &[TemplateSegment]) -> String {
     if segments.is_empty() {
         return "/".to_owned();
     }
-
     let mut rendered = String::new();
     for segment in segments {
         rendered.push('/');
@@ -908,7 +854,6 @@ fn render_template(segments: &[TemplateSegment]) -> String {
     }
     rendered
 }
-
 fn render_path_constraint(constraint: &PathConstraint) -> &'static str {
     match constraint {
         PathConstraint::Uuid => "uuid",

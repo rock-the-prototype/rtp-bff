@@ -2,10 +2,13 @@ use super::policy::{
     PathConstraint, QueryConstraint, ResourceRoutePolicyDefinition, ResourceRoutePolicyRegistry,
     RoutePolicyError, RoutePolicySnapshot, UpstreamRouteDefinition,
 };
-use std::{collections::BTreeMap, sync::Arc, thread};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Barrier},
+    thread,
+};
 
 const PROJECT_ID: &str = "8d5717b2-5b9d-4d8c-baf7-61cf9bc5f3ea";
-
 fn project_route(host: &str, upstream_path: &str) -> ResourceRoutePolicyDefinition {
     ResourceRoutePolicyDefinition {
         id: "projects.read".to_owned(),
@@ -24,7 +27,6 @@ fn project_route(host: &str, upstream_path: &str) -> ResourceRoutePolicyDefiniti
         response_headers_to_forward: vec!["Content-Type".to_owned(), "ETag".to_owned()],
     }
 }
-
 fn snapshot() -> RoutePolicySnapshot {
     RoutePolicySnapshot::try_new(
         "test-1",
@@ -35,13 +37,11 @@ fn snapshot() -> RoutePolicySnapshot {
     )
     .expect("test policy must be valid")
 }
-
 #[test]
 fn approved_get_resolves_fixed_logical_resource() {
     let resolved = snapshot()
         .resolve("projects.read", "GET", &[("id", PROJECT_ID)], &[])
         .expect("approved route must resolve");
-
     assert_eq!(resolved.route_id(), "projects.read");
     assert_eq!(resolved.method(), "GET");
     assert_eq!(resolved.origin().scheme(), "https");
@@ -52,7 +52,6 @@ fn approved_get_resolves_fixed_logical_resource() {
         format!("/v1/projects/{PROJECT_ID}")
     );
 }
-
 #[test]
 fn approved_head_resolves_fixed_logical_resource() {
     let resolved = snapshot()
@@ -61,7 +60,6 @@ fn approved_head_resolves_fixed_logical_resource() {
 
     assert_eq!(resolved.method(), "HEAD");
 }
-
 #[test]
 fn unknown_route_is_default_deny() {
     let error = snapshot()
@@ -70,7 +68,6 @@ fn unknown_route_is_default_deny() {
 
     assert_eq!(error, RoutePolicyError::UnknownRoute("unknown".to_owned()));
 }
-
 #[test]
 fn unsafe_methods_are_rejected_by_policy_validation() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -84,7 +81,6 @@ fn unsafe_methods_are_rejected_by_policy_validation() {
         RoutePolicyError::UnsupportedMethod("POST".to_owned())
     );
 }
-
 #[test]
 fn disallowed_method_is_rejected_before_any_network_layer_exists() {
     let error = snapshot()
@@ -93,7 +89,6 @@ fn disallowed_method_is_rejected_before_any_network_layer_exists() {
 
     assert!(matches!(error, RoutePolicyError::MethodNotAllowed { .. }));
 }
-
 #[test]
 fn http_upstream_is_rejected() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -107,7 +102,6 @@ fn http_upstream_is_rejected() {
         RoutePolicyError::UnsupportedScheme("http".to_owned())
     );
 }
-
 #[test]
 fn invalid_host_is_rejected() {
     let route = project_route("evil.example.invalid/path", "/v1/projects/{id}");
@@ -120,7 +114,6 @@ fn invalid_host_is_rejected() {
         RoutePolicyError::InvalidHost("evil.example.invalid/path".to_owned())
     );
 }
-
 #[test]
 fn redirect_following_is_rejected_by_policy_validation() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -134,7 +127,6 @@ fn redirect_following_is_rejected_by_policy_validation() {
         RoutePolicyError::RedirectFollowingForbidden("projects.read".to_owned())
     );
 }
-
 #[test]
 fn duplicate_route_ids_are_rejected() {
     let first = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -148,7 +140,6 @@ fn duplicate_route_ids_are_rejected() {
         RoutePolicyError::DuplicateRouteId("projects.read".to_owned())
     );
 }
-
 #[test]
 fn duplicate_browser_path_and_method_are_rejected() {
     let first = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -157,13 +148,11 @@ fn duplicate_browser_path_and_method_are_rejected() {
 
     let error = RoutePolicySnapshot::try_new("test", vec![first, second])
         .expect_err("same browser method/path must not map ambiguously");
-
     assert!(matches!(
         error,
         RoutePolicyError::AmbiguousBrowserRoute { .. }
     ));
 }
-
 #[test]
 fn equivalent_browser_path_shapes_are_rejected_as_ambiguous() {
     let first = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -171,7 +160,6 @@ fn equivalent_browser_path_shapes_are_rejected_as_ambiguous() {
     second.id = "projects.archive".to_owned();
     second.browser_path = "/api/projects/{project_id}".to_owned();
     second.path_parameters = BTreeMap::from([("project_id".to_owned(), PathConstraint::Uuid)]);
-
     let error = RoutePolicySnapshot::try_new("test", vec![first, second])
         .expect_err("equivalent browser route shapes must be rejected");
 
@@ -180,7 +168,17 @@ fn equivalent_browser_path_shapes_are_rejected_as_ambiguous() {
         RoutePolicyError::AmbiguousBrowserRoute { .. }
     ));
 }
+#[test]
+fn root_browser_path_is_rejected() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects");
+    route.browser_path = "/".to_owned();
+    route.path_parameters = BTreeMap::new();
 
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("root browser path must be rejected");
+
+    assert_eq!(error, RoutePolicyError::InvalidBrowserPath("/".to_owned()));
+}
 #[test]
 fn unsafe_static_upstream_template_is_rejected() {
     let route = project_route("projects-api.example.invalid", "/v1/../projects/{id}");
@@ -190,7 +188,6 @@ fn unsafe_static_upstream_template_is_rejected() {
         Err(RoutePolicyError::InvalidPathTemplate(_))
     ));
 }
-
 #[test]
 fn percent_encoded_upstream_template_is_rejected() {
     let route = project_route("projects-api.example.invalid", "/v1/projects/%2F/{id}");
@@ -200,7 +197,6 @@ fn percent_encoded_upstream_template_is_rejected() {
         Err(RoutePolicyError::InvalidPathTemplate(_))
     ));
 }
-
 #[test]
 fn path_traversal_value_is_rejected() {
     let error = snapshot()
@@ -212,7 +208,6 @@ fn path_traversal_value_is_rejected() {
         RoutePolicyError::InvalidPathParameter("id".to_owned())
     );
 }
-
 #[test]
 fn encoded_separator_value_is_rejected() {
     let error = snapshot()
@@ -224,7 +219,6 @@ fn encoded_separator_value_is_rejected() {
         RoutePolicyError::InvalidPathParameter("id".to_owned())
     );
 }
-
 #[test]
 fn absolute_url_value_cannot_override_destination() {
     let error = snapshot()
@@ -241,7 +235,6 @@ fn absolute_url_value_cannot_override_destination() {
         RoutePolicyError::InvalidPathParameter("id".to_owned())
     );
 }
-
 #[test]
 fn unexpected_path_parameter_is_rejected() {
     let error = snapshot()
@@ -258,7 +251,6 @@ fn unexpected_path_parameter_is_rejected() {
         RoutePolicyError::UnexpectedPathParameter("host".to_owned())
     );
 }
-
 #[test]
 fn missing_path_parameter_is_rejected() {
     let error = snapshot()
@@ -270,7 +262,6 @@ fn missing_path_parameter_is_rejected() {
         RoutePolicyError::MissingPathParameter("id".to_owned())
     );
 }
-
 #[test]
 fn unlisted_query_parameter_is_rejected() {
     let error = snapshot()
@@ -287,7 +278,6 @@ fn unlisted_query_parameter_is_rejected() {
         RoutePolicyError::QueryParameterNotAllowed("target".to_owned())
     );
 }
-
 #[test]
 fn explicitly_allowed_query_parameter_is_constrained_and_canonicalized() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -297,7 +287,6 @@ fn explicitly_allowed_query_parameter_is_constrained_and_canonicalized() {
     );
     let snapshot =
         RoutePolicySnapshot::try_new("test", vec![route]).expect("query policy must be valid");
-
     let resolved = snapshot
         .resolve(
             "projects.read",
@@ -312,7 +301,6 @@ fn explicitly_allowed_query_parameter_is_constrained_and_canonicalized() {
         format!("/v1/projects/{PROJECT_ID}?view=summary")
     );
 }
-
 #[test]
 fn unsafe_query_value_is_rejected() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -322,7 +310,6 @@ fn unsafe_query_value_is_rejected() {
     );
     let snapshot =
         RoutePolicySnapshot::try_new("test", vec![route]).expect("query policy must be valid");
-
     let error = snapshot
         .resolve(
             "projects.read",
@@ -337,7 +324,6 @@ fn unsafe_query_value_is_rejected() {
         RoutePolicyError::InvalidQueryParameter("view".to_owned())
     );
 }
-
 #[test]
 fn browser_authorization_cannot_be_allowlisted_for_forwarding() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -347,13 +333,11 @@ fn browser_authorization_cannot_be_allowlisted_for_forwarding() {
 
     let error = RoutePolicySnapshot::try_new("test", vec![route])
         .expect_err("browser Authorization must never be an allowlisted forwarded header");
-
     assert_eq!(
         error,
         RoutePolicyError::ForbiddenRequestForwardHeader("authorization".to_owned())
     );
 }
-
 #[test]
 fn session_cookie_cannot_be_allowlisted_for_forwarding() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -367,7 +351,6 @@ fn session_cookie_cannot_be_allowlisted_for_forwarding() {
         RoutePolicyError::ForbiddenRequestForwardHeader("cookie".to_owned())
     );
 }
-
 #[test]
 fn upstream_set_cookie_cannot_be_allowlisted_for_response_forwarding() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
@@ -377,13 +360,11 @@ fn upstream_set_cookie_cannot_be_allowlisted_for_response_forwarding() {
 
     let error = RoutePolicySnapshot::try_new("test", vec![route])
         .expect_err("Set-Cookie must never be a forwarded response header");
-
     assert_eq!(
         error,
         RoutePolicyError::ForbiddenResponseForwardHeader("set-cookie".to_owned())
     );
 }
-
 #[test]
 fn active_snapshot_has_stable_non_secret_digest() {
     let first = snapshot();
@@ -393,7 +374,6 @@ fn active_snapshot_has_stable_non_secret_digest() {
     assert!(first.digest().starts_with("sha256:"));
     assert_eq!(first.digest().len(), 71);
 }
-
 #[test]
 fn digest_changes_when_security_relevant_destination_changes() {
     let first = snapshot();
@@ -408,7 +388,31 @@ fn digest_changes_when_security_relevant_destination_changes() {
 
     assert_ne!(first.digest(), second.digest());
 }
+#[test]
+fn digest_frames_version_to_prevent_serialization_collision() {
+    let regular = snapshot();
 
+    let injected_version = concat!(
+        "test-1\n",
+        "route=projects.read\n",
+        "browser=/api/projects/{id}\n",
+        "methods=GET,HEAD\n",
+        "origin=https://projects-api.example.invalid:443\n",
+        "path=/v1/projects/{id}\n",
+        "path-param=id:uuid\n",
+        "request-headers=accept,if-none-match\n",
+        "response-headers=content-type,etag"
+    );
+
+    let empty = RoutePolicySnapshot::try_new(injected_version, vec![])
+        .expect("version remains syntactically permitted");
+
+    assert_ne!(
+        regular.digest(),
+        empty.digest(),
+        "version framing must prevent canonical serialization collisions"
+    );
+}
 #[test]
 fn invalid_policy_update_keeps_last_known_valid_snapshot() {
     let registry = ResourceRoutePolicyRegistry::new(snapshot());
@@ -420,7 +424,6 @@ fn invalid_policy_update_keeps_last_known_valid_snapshot() {
 
     let mut invalid = project_route("evil.example.invalid", "/v2/projects/{id}");
     invalid.upstream.scheme = "http".to_owned();
-
     assert!(
         registry
             .activate_candidate("invalid", vec![invalid])
@@ -434,7 +437,6 @@ fn invalid_policy_update_keeps_last_known_valid_snapshot() {
         .to_owned();
     assert_eq!(before, after);
 }
-
 #[test]
 fn successful_policy_activation_replaces_complete_snapshot() {
     let registry = ResourceRoutePolicyRegistry::new(snapshot());
@@ -448,7 +450,6 @@ fn successful_policy_activation_replaces_complete_snapshot() {
             )],
         )
         .expect("valid candidate must activate");
-
     let resolved = registry
         .resolve("projects.read", "GET", &[("id", PROJECT_ID)], &[])
         .expect("new policy must resolve");
@@ -459,31 +460,61 @@ fn successful_policy_activation_replaces_complete_snapshot() {
         format!("/v2/projects/{PROJECT_ID}")
     );
 }
-
 #[test]
-fn concurrent_readers_observe_only_complete_old_or_new_snapshots() {
+fn concurrent_readers_observe_complete_snapshots_across_replacement() {
+    const READER_COUNT: usize = 4;
+
     let registry = Arc::new(ResourceRoutePolicyRegistry::new(snapshot()));
+    let readers_ready = Arc::new(Barrier::new(READER_COUNT + 1));
+    let replacement_complete = Arc::new(Barrier::new(READER_COUNT + 1));
     let mut readers = Vec::new();
 
-    for _ in 0..4 {
+    for _ in 0..READER_COUNT {
         let registry = Arc::clone(&registry);
+        let readers_ready = Arc::clone(&readers_ready);
+        let replacement_complete = Arc::clone(&replacement_complete);
+
         readers.push(thread::spawn(move || {
-            for _ in 0..500 {
-                let resolved = registry
-                    .resolve("projects.read", "GET", &[("id", PROJECT_ID)], &[])
-                    .expect("active snapshot must resolve");
-                let observed_host = resolved.origin().host();
-                let observed_path = resolved.path_and_query();
-                let old_path = format!("/v1/projects/{PROJECT_ID}");
-                let new_path = format!("/v2/projects/{PROJECT_ID}");
-                assert!(
-                    (observed_host == "projects-api.example.invalid" && observed_path == old_path)
-                        || (observed_host == "projects-api-2.example.invalid"
-                            && observed_path == new_path)
-                );
-            }
+            let old_snapshot = registry
+                .active_snapshot()
+                .expect("registry must be readable");
+
+            assert_eq!(old_snapshot.version(), "test-1");
+            readers_ready.wait();
+            replacement_complete.wait();
+
+            let old_resolved = old_snapshot
+                .resolve("projects.read", "GET", &[("id", PROJECT_ID)], &[])
+                .expect("captured old snapshot must remain valid");
+
+            assert_eq!(old_resolved.origin().host(), "projects-api.example.invalid");
+            assert_eq!(
+                old_resolved.path_and_query(),
+                format!("/v1/projects/{PROJECT_ID}")
+            );
+
+            let new_snapshot = registry
+                .active_snapshot()
+                .expect("registry must remain readable");
+
+            assert_eq!(new_snapshot.version(), "test-2");
+
+            let new_resolved = new_snapshot
+                .resolve("projects.read", "GET", &[("id", PROJECT_ID)], &[])
+                .expect("replacement snapshot must resolve");
+
+            assert_eq!(
+                new_resolved.origin().host(),
+                "projects-api-2.example.invalid"
+            );
+            assert_eq!(
+                new_resolved.path_and_query(),
+                format!("/v2/projects/{PROJECT_ID}")
+            );
         }));
     }
+
+    readers_ready.wait();
 
     registry
         .activate_candidate(
@@ -494,6 +525,8 @@ fn concurrent_readers_observe_only_complete_old_or_new_snapshots() {
             )],
         )
         .expect("valid candidate must activate");
+
+    replacement_complete.wait();
 
     for reader in readers {
         reader.join().expect("reader thread must not panic");
