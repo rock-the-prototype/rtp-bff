@@ -554,7 +554,7 @@ fn digest_frames_version_to_prevent_serialization_collision() {
         "path=/v1/projects/{id}\n",
         "path-param=id:uuid\n",
         "request-headers=accept,if-none-match\n",
-        "response-headers=content-type,etag"
+        "response-headers=content-type,e-tag"
     );
 
     let empty = RoutePolicySnapshot::try_new(injected_version, vec![])
@@ -688,4 +688,53 @@ fn concurrent_readers_observe_complete_snapshots_across_replacement() {
     for reader in readers {
         reader.join().expect("reader thread must not panic");
     }
+}
+#[test]
+fn uuid_query_parameter_accepts_canonical_uuid() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route
+        .query_parameters
+        .insert("cursor".to_owned(), QueryConstraint::Uuid);
+
+    let snapshot =
+        RoutePolicySnapshot::try_new("test", vec![route]).expect("UUID query policy must be valid");
+
+    let resolved = snapshot
+        .resolve(
+            "projects.read",
+            "GET",
+            &[("id", PROJECT_ID)],
+            &[("cursor", PROJECT_ID)],
+        )
+        .expect("canonical UUID query parameter must resolve");
+
+    assert_eq!(
+        resolved.path_and_query(),
+        format!("/v1/projects/{PROJECT_ID}?cursor={PROJECT_ID}")
+    );
+}
+
+#[test]
+fn uuid_query_parameter_rejects_non_uuid_value() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route
+        .query_parameters
+        .insert("cursor".to_owned(), QueryConstraint::Uuid);
+
+    let snapshot =
+        RoutePolicySnapshot::try_new("test", vec![route]).expect("UUID query policy must be valid");
+
+    let error = snapshot
+        .resolve(
+            "projects.read",
+            "GET",
+            &[("id", PROJECT_ID)],
+            &[("cursor", "not-a-uuid")],
+        )
+        .expect_err("non-UUID query parameter must fail closed");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::InvalidQueryParameter("cursor".to_owned())
+    );
 }
