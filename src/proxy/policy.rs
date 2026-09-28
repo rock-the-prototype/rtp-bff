@@ -30,6 +30,8 @@ const FORBIDDEN_RESPONSE_FORWARD_HEADERS: &[&str] = &[
     "keep-alive",
     "proxy-connection",
     "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-authentication-info",
     "te",
     "trailer",
     "transfer-encoding",
@@ -137,7 +139,7 @@ enum TemplateSegment {
 struct ValidatedRoutePolicy {
     id: String,
     browser_path: String,
-    browser_path_shape: String,
+    browser_path_segments: Vec<TemplateSegment>,
     methods: BTreeSet<String>,
     origin: ApprovedOrigin,
     upstream_path: Vec<TemplateSegment>,
@@ -163,7 +165,6 @@ impl RoutePolicySnapshot {
             return Err(RoutePolicyError::EmptyVersion);
         }
         let mut routes = BTreeMap::new();
-        let mut browser_bindings = BTreeMap::<(String, String), String>::new();
 
         for definition in definitions {
             let validated = validate_route(definition)?;
@@ -171,19 +172,20 @@ impl RoutePolicySnapshot {
             if routes.contains_key(&validated.id) {
                 return Err(RoutePolicyError::DuplicateRouteId(validated.id));
             }
-            for method in &validated.methods {
-                let key = (validated.browser_path_shape.clone(), method.clone());
-                if let Some(existing_route) =
-                    browser_bindings.insert(key.clone(), validated.id.clone())
+
+            for existing in routes.values() {
+                if let Some(method) = shared_method(existing, &validated)
+                    && browser_routes_overlap(existing, &validated)
                 {
                     return Err(RoutePolicyError::AmbiguousBrowserRoute {
-                        path: key.0,
-                        method: key.1,
-                        first_route: existing_route,
-                        second_route: validated.id,
+                        path: validated.browser_path.clone(),
+                        method,
+                        first_route: existing.id.clone(),
+                        second_route: validated.id.clone(),
                     });
                 }
             }
+
             routes.insert(validated.id.clone(), validated);
         }
 
@@ -220,11 +222,10 @@ impl RoutePolicySnapshot {
             .routes
             .get(route_id)
             .ok_or_else(|| RoutePolicyError::UnknownRoute(route_id.to_owned()))?;
-        let method = method.to_ascii_uppercase();
-        if !route.methods.contains(&method) {
+        if !route.methods.contains(method) {
             return Err(RoutePolicyError::MethodNotAllowed {
                 route_id: route_id.to_owned(),
-                method,
+                method: method.to_owned(),
             });
         }
 
@@ -240,7 +241,7 @@ impl RoutePolicySnapshot {
         };
         Ok(ResolvedResourceRoute {
             route_id: route.id.clone(),
-            method,
+            method: method.to_owned(),
             origin: route.origin.clone(),
             path_and_query,
             request_headers_to_forward: route.request_headers_to_forward.clone(),
@@ -405,14 +406,13 @@ fn validate_route(
     }
     let mut methods = BTreeSet::new();
     for method in definition.methods {
-        let method = method.to_ascii_uppercase();
         if method != "GET" && method != "HEAD" {
             return Err(RoutePolicyError::UnsupportedMethod(method));
         }
         methods.insert(method);
     }
 
-    let (browser_path, browser_path_shape) =
+    let (browser_path, browser_path_segments) =
         validate_browser_path(&definition.browser_path, &definition.path_parameters)?;
     let origin = validate_origin(&definition.upstream)?;
     if definition.upstream.follow_redirects {
@@ -439,7 +439,7 @@ fn validate_route(
     Ok(ValidatedRoutePolicy {
         id: definition.id,
         browser_path,
-        browser_path_shape,
+        browser_path_segments,
         methods,
         origin,
         upstream_path,
@@ -463,24 +463,70 @@ fn validate_route_id(id: &str) -> Result<(), RoutePolicyError> {
 fn validate_browser_path(
     path: &str,
     constraints: &BTreeMap<String, PathConstraint>,
-) -> Result<(String, String), RoutePolicyError> {
+) -> Result<(String, Vec<TemplateSegment>), RoutePolicyError> {
     let segments = parse_path_template(path, constraints, true).map_err(|error| match error {
         RoutePolicyError::InvalidPathTemplate(_) => {
             RoutePolicyError::InvalidBrowserPath(path.to_owned())
         }
         other => other,
     })?;
-    let mut shape = String::new();
-    for segment in segments {
-        shape.push('/');
-        match segment {
-            TemplateSegment::Static(value) => shape.push_str(&value),
-            TemplateSegment::Parameter(_) => shape.push_str("{}"),
-        }
+
+    Ok((path.to_owned(), segments))
+}
+
+fn shared_method(first: &ValidatedRoutePolicy, second: &ValidatedRoutePolicy) -> Option<String> {
+    first.methods.intersection(&second.methods).next().cloned()
+}
+
+fn browser_routes_overlap(first: &ValidatedRoutePolicy, second: &ValidatedRoutePolicy) -> bool {
+    if first.browser_path_segments.len() != second.browser_path_segments.len() {
+        return false;
     }
 
-    Ok((path.to_owned(), shape))
+    first
+        .browser_path_segments
+        .iter()
+        .zip(&second.browser_path_segments)
+        .all(|(first_segment, second_segment)| {
+            browser_segments_overlap(first, first_segment, second, second_segment)
+        })
 }
+
+fn browser_segments_overlap(
+    first_route: &ValidatedRoutePolicy,
+    first_segment: &TemplateSegment,
+    second_route: &ValidatedRoutePolicy,
+    second_segment: &TemplateSegment,
+) -> bool {
+    match (first_segment, second_segment) {
+        (TemplateSegment::Static(first), TemplateSegment::Static(second)) => first == second,
+        (TemplateSegment::Parameter(first_name), TemplateSegment::Parameter(second_name)) => {
+            match (
+                first_route.path_parameters.get(first_name),
+                second_route.path_parameters.get(second_name),
+            ) {
+                (Some(first), Some(second)) => path_constraints_overlap(first, second),
+                _ => false,
+            }
+        }
+        (TemplateSegment::Static(value), TemplateSegment::Parameter(name)) => second_route
+            .path_parameters
+            .get(name)
+            .is_some_and(|constraint| path_value_matches(constraint, value)),
+        (TemplateSegment::Parameter(name), TemplateSegment::Static(value)) => first_route
+            .path_parameters
+            .get(name)
+            .is_some_and(|constraint| path_value_matches(constraint, value)),
+    }
+}
+
+fn path_constraints_overlap(first: &PathConstraint, second: &PathConstraint) -> bool {
+    matches!(
+        (first, second),
+        (PathConstraint::Uuid, PathConstraint::Uuid)
+    )
+}
+
 fn validate_origin(upstream: &UpstreamRouteDefinition) -> Result<ApprovedOrigin, RoutePolicyError> {
     if !upstream.scheme.eq_ignore_ascii_case("https") {
         return Err(RoutePolicyError::UnsupportedScheme(upstream.scheme.clone()));

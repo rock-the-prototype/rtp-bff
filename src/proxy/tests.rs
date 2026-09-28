@@ -55,10 +55,36 @@ fn approved_get_resolves_fixed_logical_resource() {
 #[test]
 fn approved_head_resolves_fixed_logical_resource() {
     let resolved = snapshot()
-        .resolve("projects.read", "head", &[("id", PROJECT_ID)], &[])
-        .expect("HEAD must be allowed case-insensitively");
+        .resolve("projects.read", "HEAD", &[("id", PROJECT_ID)], &[])
+        .expect("approved HEAD route must resolve");
 
     assert_eq!(resolved.method(), "HEAD");
+}
+
+#[test]
+fn lowercase_method_is_rejected_as_distinct_http_method() {
+    let error = snapshot()
+        .resolve("projects.read", "get", &[("id", PROJECT_ID)], &[])
+        .expect_err("HTTP method tokens are case-sensitive");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::MethodNotAllowed {
+            route_id: "projects.read".to_owned(),
+            method: "get".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn lowercase_policy_method_is_rejected_instead_of_normalized() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route.methods = vec!["get".to_owned()];
+
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("policy methods must use the exact approved HTTP method token");
+
+    assert_eq!(error, RoutePolicyError::UnsupportedMethod("get".to_owned()));
 }
 #[test]
 fn unknown_route_is_default_deny() {
@@ -168,6 +194,55 @@ fn equivalent_browser_path_shapes_are_rejected_as_ambiguous() {
         RoutePolicyError::AmbiguousBrowserRoute { .. }
     ));
 }
+#[test]
+fn static_browser_route_overlapping_uuid_parameter_route_is_rejected() {
+    let parameterized = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    let mut static_route = project_route("archive-api.example.invalid", "/v1/archive/fixed");
+    static_route.id = "projects.fixed".to_owned();
+    static_route.browser_path = format!("/api/projects/{PROJECT_ID}");
+    static_route.path_parameters = BTreeMap::new();
+
+    let error = RoutePolicySnapshot::try_new("test", vec![parameterized, static_route])
+        .expect_err("static route matching the UUID constraint must be ambiguous");
+
+    assert!(matches!(
+        error,
+        RoutePolicyError::AmbiguousBrowserRoute { .. }
+    ));
+}
+
+#[test]
+fn static_browser_route_outside_uuid_constraint_does_not_overlap() {
+    let parameterized = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    let mut static_route = project_route("archive-api.example.invalid", "/v1/archive");
+    static_route.id = "projects.latest".to_owned();
+    static_route.browser_path = "/api/projects/latest".to_owned();
+    static_route.upstream.path_template = "/v1/archive".to_owned();
+    static_route.path_parameters = BTreeMap::new();
+
+    let snapshot = RoutePolicySnapshot::try_new("test", vec![parameterized, static_route])
+        .expect("non-UUID static segment must not overlap UUID parameter route");
+
+    assert_eq!(snapshot.route_count(), 2);
+}
+
+#[test]
+fn overlapping_browser_paths_with_disjoint_methods_are_allowed() {
+    let mut parameterized = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    parameterized.methods = vec!["GET".to_owned()];
+
+    let mut static_route = project_route("archive-api.example.invalid", "/v1/archive/fixed");
+    static_route.id = "projects.fixed".to_owned();
+    static_route.browser_path = format!("/api/projects/{PROJECT_ID}");
+    static_route.path_parameters = BTreeMap::new();
+    static_route.methods = vec!["HEAD".to_owned()];
+
+    let snapshot = RoutePolicySnapshot::try_new("test", vec![parameterized, static_route])
+        .expect("overlapping paths are unambiguous when their method sets are disjoint");
+
+    assert_eq!(snapshot.route_count(), 2);
+}
+
 #[test]
 fn root_browser_path_is_rejected() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects");
@@ -408,6 +483,38 @@ fn keep_alive_cannot_be_allowlisted_for_response_forwarding() {
     assert_eq!(
         error,
         RoutePolicyError::ForbiddenResponseForwardHeader("keep-alive".to_owned())
+    );
+}
+
+#[test]
+fn proxy_authorization_cannot_be_allowlisted_for_response_forwarding() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route
+        .response_headers_to_forward
+        .push("Proxy-Authorization".to_owned());
+
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("proxy credentials must never be forwarded to the browser");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::ForbiddenResponseForwardHeader("proxy-authorization".to_owned())
+    );
+}
+
+#[test]
+fn proxy_authentication_info_cannot_be_allowlisted_for_response_forwarding() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route
+        .response_headers_to_forward
+        .push("Proxy-Authentication-Info".to_owned());
+
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("proxy authentication metadata must not cross the BFF response boundary");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::ForbiddenResponseForwardHeader("proxy-authentication-info".to_owned())
     );
 }
 
