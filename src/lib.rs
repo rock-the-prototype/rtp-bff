@@ -36,3 +36,5 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }
+
+pub mod proxy;
