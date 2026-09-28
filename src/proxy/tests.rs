@@ -738,3 +738,34 @@ fn uuid_query_parameter_rejects_non_uuid_value() {
         RoutePolicyError::InvalidQueryParameter("cursor".to_owned())
     );
 }
+#[test]
+fn authorization_cannot_be_allowlisted_for_response_forwarding() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route
+        .response_headers_to_forward
+        .push("Authorization".to_owned());
+
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("Authorization must never be a forwarded response header");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::ForbiddenResponseForwardHeader("authorization".to_owned())
+    );
+}
+
+#[test]
+fn authentication_info_cannot_be_allowlisted_for_response_forwarding() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route
+        .response_headers_to_forward
+        .push("Authentication-Info".to_owned());
+
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("Authentication-Info must never be a forwarded response header");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::ForbiddenResponseForwardHeader("authentication-info".to_owned())
+    );
+}
