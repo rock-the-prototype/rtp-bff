@@ -10,9 +10,12 @@ const MAX_PARAMETER_NAME_LEN: usize = 64;
 const MAX_HEADER_NAME_LEN: usize = 128;
 const MAX_HOST_LEN: usize = 253;
 const FORBIDDEN_REQUEST_FORWARD_HEADERS: &[&str] = &[
+    "host",
+    "keep-alive",
     "authorization",
     "cookie",
     "connection",
+    "proxy-connection",
     "proxy-authorization",
     "proxy-authenticate",
     "te",
@@ -24,6 +27,8 @@ const FORBIDDEN_REQUEST_FORWARD_HEADERS: &[&str] = &[
 const FORBIDDEN_RESPONSE_FORWARD_HEADERS: &[&str] = &[
     "set-cookie",
     "connection",
+    "keep-alive",
+    "proxy-connection",
     "proxy-authenticate",
     "te",
     "trailer",

@@ -339,6 +339,36 @@ fn browser_authorization_cannot_be_allowlisted_for_forwarding() {
     );
 }
 #[test]
+fn browser_host_cannot_be_allowlisted_for_forwarding() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route.request_headers_to_forward.push("Host".to_owned());
+
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("browser Host must never override the approved upstream authority");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::ForbiddenRequestForwardHeader("host".to_owned())
+    );
+}
+
+#[test]
+fn keep_alive_cannot_be_allowlisted_for_request_forwarding() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route
+        .request_headers_to_forward
+        .push("Keep-Alive".to_owned());
+
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("hop-by-hop Keep-Alive must never be forwarded upstream");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::ForbiddenRequestForwardHeader("keep-alive".to_owned())
+    );
+}
+
+#[test]
 fn session_cookie_cannot_be_allowlisted_for_forwarding() {
     let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
     route.request_headers_to_forward.push("Cookie".to_owned());
@@ -365,6 +395,22 @@ fn upstream_set_cookie_cannot_be_allowlisted_for_response_forwarding() {
         RoutePolicyError::ForbiddenResponseForwardHeader("set-cookie".to_owned())
     );
 }
+#[test]
+fn keep_alive_cannot_be_allowlisted_for_response_forwarding() {
+    let mut route = project_route("projects-api.example.invalid", "/v1/projects/{id}");
+    route
+        .response_headers_to_forward
+        .push("Keep-Alive".to_owned());
+
+    let error = RoutePolicySnapshot::try_new("test", vec![route])
+        .expect_err("hop-by-hop Keep-Alive must never be forwarded to the browser");
+
+    assert_eq!(
+        error,
+        RoutePolicyError::ForbiddenResponseForwardHeader("keep-alive".to_owned())
+    );
+}
+
 #[test]
 fn active_snapshot_has_stable_non_secret_digest() {
     let first = snapshot();
@@ -475,13 +521,16 @@ fn concurrent_readers_observe_complete_snapshots_across_replacement() {
         let replacement_complete = Arc::clone(&replacement_complete);
 
         readers.push(thread::spawn(move || {
-            let old_snapshot = registry
-                .active_snapshot()
-                .expect("registry must be readable");
+            // Capture the result first, but do not assert or unwrap before both
+            // synchronization points. A pre-barrier panic would strand the
+            // remaining participants and deadlock the test.
+            let old_snapshot_result = registry.active_snapshot();
 
-            assert_eq!(old_snapshot.version(), "test-1");
             readers_ready.wait();
             replacement_complete.wait();
+
+            let old_snapshot = old_snapshot_result.expect("registry must be readable");
+            assert_eq!(old_snapshot.version(), "test-1");
 
             let old_resolved = old_snapshot
                 .resolve("projects.read", "GET", &[("id", PROJECT_ID)], &[])
@@ -516,17 +565,18 @@ fn concurrent_readers_observe_complete_snapshots_across_replacement() {
 
     readers_ready.wait();
 
-    registry
-        .activate_candidate(
-            "test-2",
-            vec![project_route(
-                "projects-api-2.example.invalid",
-                "/v2/projects/{id}",
-            )],
-        )
-        .expect("valid candidate must activate");
+    let activation_result = registry.activate_candidate(
+        "test-2",
+        vec![project_route(
+            "projects-api-2.example.invalid",
+            "/v2/projects/{id}",
+        )],
+    );
 
+    // Always release the readers before asserting activation success. If the
+    // activation unexpectedly fails, no reader can remain blocked forever.
     replacement_complete.wait();
+    activation_result.expect("valid candidate must activate");
 
     for reader in readers {
         reader.join().expect("reader thread must not panic");
