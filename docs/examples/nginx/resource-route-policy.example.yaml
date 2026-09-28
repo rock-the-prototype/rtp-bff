@@ -1,0 +1,50 @@
+# EXAMPLE ONLY.
+# Public-safe documentation artifact.
+# MUST NOT contain production hosts, addresses, credentials, secrets,
+# internal topology, or deployment-specific routing data.
+
+version: "example-1"
+
+routes:
+  - id: "projects.read"
+    browser:
+      methods: ["GET", "HEAD"]
+      path: "/api/projects/{id}"
+
+    upstream:
+      scheme: "https"
+      host: "projects-api.example.invalid"
+      port: 443
+      path: "/v1/projects/{id}"
+      follow_redirects: false
+      tls_verify: true
+
+    parameters:
+      path:
+        id:
+          type: "uuid"
+      query:
+        allow: []
+
+    request_headers:
+      forward: ["Accept", "If-None-Match"]
+      strip:
+        - "Authorization"
+        - "Cookie"
+        - "Connection"
+        - "Proxy-Authorization"
+        - "Proxy-Authenticate"
+        - "TE"
+        - "Trailer"
+        - "Transfer-Encoding"
+        - "Upgrade"
+
+    response_headers:
+      strip:
+        - "Set-Cookie"
+        - "Connection"
+        - "Proxy-Authenticate"
+        - "TE"
+        - "Trailer"
+        - "Transfer-Encoding"
+        - "Upgrade"
