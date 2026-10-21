@@ -2,7 +2,7 @@ use std::{future::Future, time::Duration};
 
 use axum::http::StatusCode;
 use openidconnect::{
-    ClaimsVerificationError, ClientId, Nonce, SignatureVerificationError,
+    ClaimsVerificationError, ClientId, Nonce, SignatureVerificationError, SubjectIdentifier,
     core::{CoreClient, CoreIdToken, CoreProviderMetadata},
     reqwest,
 };
@@ -61,7 +61,7 @@ fn verify_id_token_once(
     provider_metadata: &CoreProviderMetadata,
     id_token: &CoreIdToken,
     nonce: &Nonce,
-) -> Result<(), ClaimsVerificationError> {
+) -> Result<SubjectIdentifier, ClaimsVerificationError> {
     let client = CoreClient::from_provider_metadata(
         provider_metadata.clone(),
         ClientId::new(config.client_id.clone()),
@@ -73,7 +73,9 @@ fn verify_id_token_once(
         .id_token_verifier()
         .set_allowed_algs(accepted_id_token_signing_algorithms());
 
-    id_token.claims(&verifier, nonce).map(|_| ())
+    id_token
+        .claims(&verifier, nonce)
+        .map(|claims| claims.subject().clone())
 }
 
 pub(super) async fn verify_id_token_with_single_refresh<F, Fut>(
@@ -82,13 +84,13 @@ pub(super) async fn verify_id_token_with_single_refresh<F, Fut>(
     id_token: &CoreIdToken,
     nonce: &Nonce,
     refresh: F,
-) -> Result<(), StatusCode>
+) -> Result<SubjectIdentifier, StatusCode>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<CoreProviderMetadata, StatusCode>>,
 {
     match verify_id_token_once(config, &initial_metadata, id_token, nonce) {
-        Ok(()) => Ok(()),
+        Ok(subject) => Ok(subject),
         Err(ClaimsVerificationError::SignatureVerification(
             SignatureVerificationError::NoMatchingKey,
         )) => {

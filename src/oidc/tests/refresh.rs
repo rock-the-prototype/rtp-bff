@@ -34,6 +34,7 @@ async fn put_session(
                 access_token,
                 refresh_token,
                 access_token_expires_at: expires_at,
+                identity: test_identity(state),
             },
         )
         .await
@@ -504,6 +505,7 @@ async fn refresh_waiter_reuses_token_written_by_owner() {
         access_token: owner_access_token.clone(),
         refresh_token: Some(expected_refresh_token),
         access_token_expires_at: Some(TEST_NOW + 300),
+        identity: test_identity(&state),
     };
 
     assert!(matches!(
