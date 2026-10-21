@@ -43,7 +43,9 @@ pub(super) use time::Duration as CookieDuration;
 pub(super) use tokio::sync::{Barrier, Mutex as AsyncMutex};
 pub(super) use tower::ServiceExt;
 
-pub(super) use crate::session::{AuthenticatedSession, SessionStore, session_cookie_name};
+pub(super) use crate::session::{
+    AuthenticatedSession, SessionIdentity, SessionStore, session_cookie_name,
+};
 
 pub(super) use super::super::{
     LOGIN_BURST, LOGIN_REQUESTS_PER_MINUTE, OidcState,
@@ -59,11 +61,21 @@ pub(super) use super::super::{
 };
 
 pub(super) const MOCK_ISSUER: &str = "https://mock.example";
+const MOCK_ID_TOKEN_LIFETIME_SECONDS: u64 = 300;
 
 pub(super) fn runtime_secret() -> String {
     CsrfToken::new_random_len(BROWSER_BINDING_BYTES)
         .secret()
         .to_owned()
+}
+
+pub(super) fn test_identity(state: &OidcState) -> SessionIdentity {
+    SessionIdentity {
+        issuer: state.config.issuer.as_str().to_owned(),
+        subject: "test-subject".to_owned(),
+        email: Some("member@example.test".to_owned()),
+        email_verified: Some(true),
+    }
 }
 
 fn unix_time_seconds() -> u64 {
@@ -207,16 +219,8 @@ impl EphemeralEs256Key {
         self.compact_id_token_with_header(nonce, "ES256", &self.kid, MOCK_ISSUER)
     }
 
-    fn compact_id_token_for_issuer(&self, nonce: &str, issuer: &str) -> String {
-        self.compact_id_token_with_header(nonce, "ES256", &self.kid, issuer)
-    }
-
-    pub(super) fn compact_id_token_with_kid(&self, nonce: &str, kid: &str) -> String {
-        self.compact_id_token_with_header(nonce, "ES256", kid, MOCK_ISSUER)
-    }
-
-    pub(super) fn compact_id_token_with_algorithm(&self, nonce: &str, algorithm: &str) -> String {
-        self.compact_id_token_with_header(nonce, algorithm, &self.kid, MOCK_ISSUER)
+    fn compact_id_token_for_issuer(&self, nonce: &str, issuer: &str, subject: &str) -> String {
+        self.compact_id_token_with_header_and_subject(nonce, "ES256", &self.kid, issuer, subject)
     }
 
     fn compact_id_token_with_header(
@@ -226,13 +230,25 @@ impl EphemeralEs256Key {
         kid: &str,
         issuer: &str,
     ) -> String {
-        let now = unix_time_seconds();
         let subject = runtime_secret();
+
+        self.compact_id_token_with_header_and_subject(nonce, algorithm, kid, issuer, &subject)
+    }
+
+    fn compact_id_token_with_header_and_subject(
+        &self,
+        nonce: &str,
+        algorithm: &str,
+        kid: &str,
+        issuer: &str,
+        subject: &str,
+    ) -> String {
+        let now = unix_time_seconds();
 
         let header = format!(r#"{{"alg":"{algorithm}","typ":"JWT","kid":"{kid}"}}"#);
         let claims = format!(
             r#"{{"iss":"{issuer}","sub":"{subject}","aud":"{CLIENT_ID}","exp":{},"iat":{},"nonce":"{nonce}"}}"#,
-            now + 300,
+            now + MOCK_ID_TOKEN_LIFETIME_SECONDS,
             now
         );
 
@@ -244,6 +260,14 @@ impl EphemeralEs256Key {
         let encoded_signature = base64url_no_pad(&signature_bytes);
 
         format!("{signing_input}.{encoded_signature}")
+    }
+
+    pub(super) fn compact_id_token_with_kid(&self, nonce: &str, kid: &str) -> String {
+        self.compact_id_token_with_header(nonce, "ES256", kid, MOCK_ISSUER)
+    }
+
+    pub(super) fn compact_id_token_with_algorithm(&self, nonce: &str, algorithm: &str) -> String {
+        self.compact_id_token_with_header(nonce, algorithm, &self.kid, MOCK_ISSUER)
     }
 
     pub(super) fn id_token(&self, nonce: &str) -> CoreIdToken {
@@ -621,6 +645,7 @@ struct MockProviderState {
     jwks: Arc<Mutex<String>>,
     rotate_jwks_on_token: Option<String>,
     id_token: String,
+    subject: String,
     access_token: String,
     refresh_token: String,
     expected_code: String,
@@ -629,6 +654,7 @@ struct MockProviderState {
     discovery_calls: Arc<AtomicUsize>,
     jwks_calls: Arc<AtomicUsize>,
     token_calls: Arc<AtomicUsize>,
+    userinfo_calls: Arc<AtomicUsize>,
     client_auth_failures: Arc<AtomicUsize>,
     client_secret_body_violations: Arc<AtomicUsize>,
 }
@@ -638,6 +664,7 @@ pub(super) struct MockOidcProvider {
     pub(super) discovery_calls: Arc<AtomicUsize>,
     pub(super) jwks_calls: Arc<AtomicUsize>,
     pub(super) token_calls: Arc<AtomicUsize>,
+    pub(super) userinfo_calls: Arc<AtomicUsize>,
     pub(super) client_auth_failures: Arc<AtomicUsize>,
     pub(super) client_secret_body_violations: Arc<AtomicUsize>,
     pub(super) access_token: String,
@@ -648,7 +675,7 @@ async fn mock_discovery(State(state): State<MockProviderState>) -> impl IntoResp
     state.discovery_calls.fetch_add(1, Ordering::SeqCst);
 
     let document = format!(
-        r#"{{"issuer":"{0}","authorization_endpoint":"{0}/authorize","token_endpoint":"{0}/token","jwks_uri":"{0}/jwks","response_types_supported":["code"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["ES256"],"token_endpoint_auth_methods_supported":["client_secret_basic"]}}"#,
+        r#"{{"issuer":"{0}","authorization_endpoint":"{0}/authorize","token_endpoint":"{0}/token","userinfo_endpoint":"{0}/userinfo","jwks_uri":"{0}/jwks","response_types_supported":["code"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["ES256"],"token_endpoint_auth_methods_supported":["client_secret_basic"]}}"#,
         state.issuer
     );
 
@@ -739,6 +766,41 @@ async fn mock_provider_token(
         .into_response()
 }
 
+async fn mock_userinfo(
+    State(state): State<MockProviderState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    state.userinfo_calls.fetch_add(1, Ordering::SeqCst);
+
+    let expected_authorization = format!("Bearer {}", state.access_token);
+
+    let authorization_matches = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected_authorization);
+
+    if !authorization_matches {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(CONTENT_TYPE, "application/json")],
+            r#"{"error":"invalid_token"}"#.to_owned(),
+        )
+            .into_response();
+    }
+
+    let response = format!(
+        r#"{{"sub":"{}","email":"member@example.test","email_verified":true}}"#,
+        state.subject
+    );
+
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        response,
+    )
+        .into_response()
+}
+
 pub(super) async fn spawn_mock_oidc_provider(
     initial_jwks: String,
     rotate_jwks_on_token: Option<String>,
@@ -755,11 +817,12 @@ pub(super) async fn spawn_mock_oidc_provider(
         .local_addr()
         .expect("mock OIDC provider must have an address");
     let issuer = format!("http://{address}");
-    let id_token = token_signing_key.compact_id_token_for_issuer(nonce, &issuer);
-
+    let subject = runtime_secret();
+    let id_token = token_signing_key.compact_id_token_for_issuer(nonce, &issuer, &subject);
     let discovery_calls = Arc::new(AtomicUsize::new(0));
     let jwks_calls = Arc::new(AtomicUsize::new(0));
     let token_calls = Arc::new(AtomicUsize::new(0));
+    let userinfo_calls = Arc::new(AtomicUsize::new(0));
     let client_auth_failures = Arc::new(AtomicUsize::new(0));
     let client_secret_body_violations = Arc::new(AtomicUsize::new(0));
     let access_token = runtime_secret();
@@ -770,6 +833,7 @@ pub(super) async fn spawn_mock_oidc_provider(
         jwks: Arc::new(Mutex::new(initial_jwks)),
         rotate_jwks_on_token,
         id_token,
+        subject: subject.clone(),
         access_token: access_token.clone(),
         refresh_token: refresh_token.clone(),
         expected_code,
@@ -778,6 +842,7 @@ pub(super) async fn spawn_mock_oidc_provider(
         discovery_calls: discovery_calls.clone(),
         jwks_calls: jwks_calls.clone(),
         token_calls: token_calls.clone(),
+        userinfo_calls: userinfo_calls.clone(),
         client_auth_failures: client_auth_failures.clone(),
         client_secret_body_violations: client_secret_body_violations.clone(),
     };
@@ -786,6 +851,7 @@ pub(super) async fn spawn_mock_oidc_provider(
         .route("/.well-known/openid-configuration", get(mock_discovery))
         .route("/jwks", get(mock_jwks))
         .route("/token", post(mock_provider_token))
+        .route("/userinfo", get(mock_userinfo))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -799,6 +865,7 @@ pub(super) async fn spawn_mock_oidc_provider(
         discovery_calls,
         jwks_calls,
         token_calls,
+        userinfo_calls,
         client_auth_failures,
         client_secret_body_violations,
         access_token,

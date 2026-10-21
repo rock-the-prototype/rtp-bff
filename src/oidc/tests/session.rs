@@ -32,6 +32,7 @@ async fn check_session_with_active_session_returns_no_content() {
                 .as_secs()
                 + 300,
         ),
+        identity: test_identity(&state),
     };
 
     state

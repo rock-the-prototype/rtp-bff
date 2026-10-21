@@ -326,6 +326,7 @@ async fn refresh_with_ownership_inner(
         access_token: access_token.clone(),
         refresh_token,
         access_token_expires_at,
+        identity: current.identity.clone(),
     };
 
     match state

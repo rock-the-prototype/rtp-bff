@@ -65,12 +65,20 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 "#;
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct SessionIdentity {
+    pub(super) issuer: String,
+    pub(super) subject: String,
+    pub(super) email: Option<String>,
+    pub(super) email_verified: Option<bool>,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct AuthenticatedSession {
     pub(super) access_token: String,
     pub(super) refresh_token: Option<String>,
     pub(super) access_token_expires_at: Option<u64>,
+    pub(super) identity: SessionIdentity,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -371,10 +379,11 @@ impl SessionStore {
             return Ok(RefreshOwnedMutation::SessionMissing);
         };
 
-        stored.session = session.clone();
+        stored.session.access_token = session.access_token.clone();
+        stored.session.refresh_token = session.refresh_token.clone();
+        stored.session.access_token_expires_at = session.access_token_expires_at;
         Ok(RefreshOwnedMutation::Applied)
     }
-
     #[cfg(test)]
     pub(super) async fn invalidate_for_refresh(
         &self,
@@ -406,6 +415,16 @@ impl SessionStore {
 }
 
 #[cfg(test)]
+fn test_identity() -> SessionIdentity {
+    SessionIdentity {
+        issuer: "https://id.rock-the-prototype.com/realms/RTP".to_owned(),
+        subject: "test-subject".to_owned(),
+        email: Some("member@example.test".to_owned()),
+        email_verified: Some(true),
+    }
+}
+
+#[cfg(test)]
 fn retain_live_test_state(state: &mut TestStoreState, ttl: Duration, now: Instant) {
     state
         .sessions
@@ -424,6 +443,23 @@ fn redis_connection_manager(redis_url: &str) -> Result<ConnectionManager, String
         .map_err(|_| "Redis connection manager configuration is invalid".to_owned())
 }
 
+fn encode_optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "",
+    }
+}
+
+fn decode_optional_bool(value: Option<String>) -> Result<Option<bool>, ()> {
+    match value.as_deref() {
+        None | Some("") => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(_) => Err(()),
+    }
+}
+
 async fn redis_put(
     redis: &ConnectionManager,
     ttl: Duration,
@@ -434,6 +470,8 @@ async fn redis_put(
     let mut connection = redis.clone();
     let refresh_token = session.refresh_token.as_deref().unwrap_or("");
     let access_token_expires_at = session.access_token_expires_at.unwrap_or(0);
+    let email = session.identity.email.as_deref().unwrap_or("");
+    let email_verified = encode_optional_bool(session.identity.email_verified);
 
     redis::pipe()
         .atomic()
@@ -445,6 +483,14 @@ async fn redis_put(
         .arg(refresh_token)
         .arg("access_token_expires_at")
         .arg(access_token_expires_at)
+        .arg("issuer")
+        .arg(&session.identity.issuer)
+        .arg("subject")
+        .arg(&session.identity.subject)
+        .arg("email")
+        .arg(email)
+        .arg("email_verified")
+        .arg(email_verified)
         .ignore()
         .cmd("EXPIRE")
         .arg(&key)
@@ -462,18 +508,45 @@ async fn redis_get(
     let key = session_key(session_id);
     let mut connection = redis.clone();
 
-    let values: (Option<String>, Option<String>, Option<u64>) = redis::cmd("HMGET")
+    let values: (
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = redis::cmd("HMGET")
         .arg(&key)
         .arg("access_token")
         .arg("refresh_token")
         .arg("access_token_expires_at")
+        .arg("issuer")
+        .arg("subject")
+        .arg("email")
+        .arg("email_verified")
         .query_async(&mut connection)
         .await
         .map_err(|_| ())?;
 
-    let (access_token, refresh_token, access_token_expires_at) = values;
+    let (
+        access_token,
+        refresh_token,
+        access_token_expires_at,
+        issuer,
+        subject,
+        email,
+        email_verified,
+    ) = values;
 
     let Some(access_token) = access_token else {
+        return Ok(None);
+    };
+    let Some(issuer) = issuer.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    let Some(subject) = subject.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
 
@@ -484,10 +557,25 @@ async fn redis_get(
         Some(value) => Some(value),
     };
 
+    let email = email.filter(|value| !value.is_empty());
+    let email_verified = decode_optional_bool(email_verified)?;
+
+    let email_verified = if email.is_some() {
+        email_verified
+    } else {
+        None
+    };
+
     Ok(Some(AuthenticatedSession {
         access_token,
         refresh_token,
         access_token_expires_at,
+        identity: SessionIdentity {
+            issuer,
+            subject,
+            email,
+            email_verified,
+        },
     }))
 }
 
@@ -663,6 +751,7 @@ mod tests {
             access_token: "access-secret".to_owned(),
             refresh_token: Some("refresh-secret".to_owned()),
             access_token_expires_at: Some(12345),
+            identity: test_identity(),
         };
 
         store
@@ -691,11 +780,13 @@ mod tests {
             access_token: "initial-access".to_owned(),
             refresh_token: Some("initial-refresh".to_owned()),
             access_token_expires_at: Some(100),
+            identity: test_identity(),
         };
         let refreshed = AuthenticatedSession {
             access_token: "refreshed-access".to_owned(),
             refresh_token: Some("refreshed-refresh".to_owned()),
             access_token_expires_at: Some(200),
+            identity: test_identity(),
         };
 
         store
@@ -723,6 +814,66 @@ mod tests {
             .expect("test session store read must succeed")
             .expect("updated session must exist");
         assert!(stored == refreshed);
+    }
+
+    #[tokio::test]
+    async fn refresh_update_preserves_authenticated_identity() {
+        let store = SessionStore::for_tests();
+        let session_id = new_session_id();
+        let owner_id = new_refresh_owner_id();
+
+        let identity = test_identity();
+
+        let initial = AuthenticatedSession {
+            access_token: "initial-access".to_owned(),
+            refresh_token: Some("initial-refresh".to_owned()),
+            access_token_expires_at: Some(100),
+            identity: identity.clone(),
+        };
+
+        let refreshed = AuthenticatedSession {
+            access_token: "refreshed-access".to_owned(),
+            refresh_token: Some("refreshed-refresh".to_owned()),
+            access_token_expires_at: Some(200),
+
+            // Absichtlich eine andere Identity.
+            // Refresh darf sie NICHT übernehmen.
+            identity: SessionIdentity {
+                issuer: "https://malicious.example.test".to_owned(),
+                subject: "different-subject".to_owned(),
+                email: None,
+                email_verified: None,
+            },
+        };
+
+        store
+            .put(&session_id, &initial)
+            .await
+            .expect("initial session write must succeed");
+
+        assert!(
+            store
+                .try_acquire_refresh_lock(&session_id, &owner_id, Duration::from_secs(5))
+                .await
+                .expect("refresh lock acquisition must succeed")
+        );
+
+        assert!(matches!(
+            store
+                .update_after_refresh(&session_id, &owner_id, &refreshed)
+                .await
+                .expect("refresh update must succeed"),
+            RefreshOwnedMutation::Applied
+        ));
+
+        let stored = store
+            .get(&session_id)
+            .await
+            .expect("session read must succeed")
+            .expect("session must exist");
+
+        assert_eq!(stored.identity, identity);
+        assert_eq!(stored.access_token, "refreshed-access");
     }
 
     #[test]
@@ -847,6 +998,12 @@ mod redis_integration_tests {
             access_token: "integration-access-token".to_owned(),
             refresh_token: None,
             access_token_expires_at: None,
+            identity: SessionIdentity {
+                issuer: "https://id.rock-the-prototype.com/realms/RTP".to_owned(),
+                subject: "subject-without-email".to_owned(),
+                email: None,
+                email_verified: None,
+            },
         };
 
         redis_put(&redis, TEST_TTL, &session_id, &session)
@@ -893,6 +1050,7 @@ mod redis_integration_tests {
             access_token: "integration-access-token".to_owned(),
             refresh_token: Some("integration-refresh-token".to_owned()),
             access_token_expires_at: Some(12345),
+            identity: test_identity(),
         };
 
         redis_put(&redis, TEST_TTL, &session_id, &session)
@@ -945,11 +1103,13 @@ mod redis_integration_tests {
             access_token: "initial-access".to_owned(),
             refresh_token: Some("initial-refresh".to_owned()),
             access_token_expires_at: Some(100),
+            identity: test_identity(),
         };
         let refreshed = AuthenticatedSession {
             access_token: "refreshed-access".to_owned(),
             refresh_token: Some("refreshed-refresh".to_owned()),
             access_token_expires_at: Some(200),
+            identity: test_identity(),
         };
 
         redis_put(&redis, TEST_TTL, &session_id, &initial)
@@ -998,11 +1158,13 @@ mod redis_integration_tests {
             access_token: "initial-access".to_owned(),
             refresh_token: Some("initial-refresh".to_owned()),
             access_token_expires_at: Some(100),
+            identity: test_identity(),
         };
         let refreshed = AuthenticatedSession {
             access_token: "refreshed-access".to_owned(),
             refresh_token: Some("refreshed-refresh".to_owned()),
             access_token_expires_at: Some(200),
+            identity: test_identity(),
         };
 
         redis_put(&redis, TEST_TTL, &session_id, &initial)
@@ -1111,6 +1273,7 @@ mod redis_integration_tests {
             access_token: "integration-access-token".to_owned(),
             refresh_token: Some("integration-refresh-token".to_owned()),
             access_token_expires_at: Some(12345),
+            identity: test_identity(),
         };
 
         redis_put(&redis, TEST_TTL, &session_id, &session)
@@ -1165,16 +1328,19 @@ mod redis_integration_tests {
             access_token: "initial-access".to_owned(),
             refresh_token: Some("initial-refresh".to_owned()),
             access_token_expires_at: Some(100),
+            identity: test_identity(),
         };
         let stale_update = AuthenticatedSession {
             access_token: "stale-access".to_owned(),
             refresh_token: Some("stale-refresh".to_owned()),
             access_token_expires_at: Some(200),
+            identity: test_identity(),
         };
         let current_update = AuthenticatedSession {
             access_token: "current-access".to_owned(),
             refresh_token: Some("current-refresh".to_owned()),
             access_token_expires_at: Some(300),
+            identity: test_identity(),
         };
 
         redis_put(&redis, TEST_TTL, &session_id, &initial)
