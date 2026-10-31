@@ -501,6 +501,16 @@ async fn redis_put(
         .map_err(|_| ())
 }
 
+type RedisSessionFields = (
+    Option<String>, // access_token
+    Option<String>, // refresh_token
+    Option<u64>,    // access_token_expires_at
+    Option<String>, // issuer
+    Option<String>, // subject
+    Option<String>, // email
+    Option<String>, // email_verified
+);
+
 async fn redis_get(
     redis: &ConnectionManager,
     session_id: &str,
@@ -508,15 +518,7 @@ async fn redis_get(
     let key = session_key(session_id);
     let mut connection = redis.clone();
 
-    let values: (
-        Option<String>,
-        Option<String>,
-        Option<u64>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = redis::cmd("HMGET")
+    let values: RedisSessionFields = redis::cmd("HMGET")
         .arg(&key)
         .arg("access_token")
         .arg("refresh_token")
