@@ -206,7 +206,7 @@ pub(super) async fn callback(
         ClientId::new(state.config.client_id.clone()),
         Some(state.config.client_secret.clone()),
     )
-        .set_redirect_uri(state.config.redirect_uri.clone());
+    .set_redirect_uri(state.config.redirect_uri.clone());
 
     let token_response = match client.exchange_code(AuthorizationCode::new(code)) {
         Ok(exchange) => {
@@ -222,8 +222,7 @@ pub(super) async fn callback(
         Err(_) => return Err((jar, StatusCode::BAD_GATEWAY)),
     };
 
-    let access_token_expires_at =
-        access_token_expiry(token_response.expires_in());
+    let access_token_expires_at = access_token_expiry(token_response.expires_in());
 
     let id_token = match token_response.id_token() {
         Some(id_token) => id_token,
@@ -237,12 +236,11 @@ pub(super) async fn callback(
         &transaction.nonce,
         || refresh_provider_metadata(&state),
     )
-        .await
+    .await
     {
         Ok(subject) => subject,
         Err(status) => return Err((jar, status)),
     };
-
 
     let user_info_metadata = match provider_metadata(&state).await {
         Ok(metadata) => metadata,
@@ -254,7 +252,7 @@ pub(super) async fn callback(
         ClientId::new(state.config.client_id.clone()),
         Some(state.config.client_secret.clone()),
     )
-        .set_redirect_uri(state.config.redirect_uri.clone());
+    .set_redirect_uri(state.config.redirect_uri.clone());
 
     let user_info_request = match user_info_client.user_info(
         token_response.access_token().to_owned(),
