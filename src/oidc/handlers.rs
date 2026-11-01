@@ -196,17 +196,17 @@ pub(super) async fn callback(
         None => return Err((jar, StatusCode::BAD_REQUEST)),
     };
 
-    let provider_metadata = match provider_metadata(&state).await {
+    let initial_provider_metadata = match provider_metadata(&state).await {
         Ok(metadata) => metadata,
         Err(status) => return Err((jar, status)),
     };
 
     let client = CoreClient::from_provider_metadata(
-        provider_metadata.clone(),
+        initial_provider_metadata.clone(),
         ClientId::new(state.config.client_id.clone()),
         Some(state.config.client_secret.clone()),
     )
-    .set_redirect_uri(state.config.redirect_uri.clone());
+        .set_redirect_uri(state.config.redirect_uri.clone());
 
     let token_response = match client.exchange_code(AuthorizationCode::new(code)) {
         Ok(exchange) => {
@@ -222,6 +222,9 @@ pub(super) async fn callback(
         Err(_) => return Err((jar, StatusCode::BAD_GATEWAY)),
     };
 
+    let access_token_expires_at =
+        access_token_expiry(token_response.expires_in());
+
     let id_token = match token_response.id_token() {
         Some(id_token) => id_token,
         None => return Err((jar, StatusCode::UNAUTHORIZED)),
@@ -229,18 +232,31 @@ pub(super) async fn callback(
 
     let subject = match verify_id_token_with_single_refresh(
         &state.config,
-        provider_metadata,
+        initial_provider_metadata,
         id_token,
         &transaction.nonce,
         || refresh_provider_metadata(&state),
     )
-    .await
+        .await
     {
         Ok(subject) => subject,
         Err(status) => return Err((jar, status)),
     };
 
-    let user_info_request = match client.user_info(
+
+    let user_info_metadata = match provider_metadata(&state).await {
+        Ok(metadata) => metadata,
+        Err(status) => return Err((jar, status)),
+    };
+
+    let user_info_client = CoreClient::from_provider_metadata(
+        user_info_metadata,
+        ClientId::new(state.config.client_id.clone()),
+        Some(state.config.client_secret.clone()),
+    )
+        .set_redirect_uri(state.config.redirect_uri.clone());
+
+    let user_info_request = match user_info_client.user_info(
         token_response.access_token().to_owned(),
         Some(subject.clone()),
     ) {
@@ -277,7 +293,7 @@ pub(super) async fn callback(
         refresh_token: token_response
             .refresh_token()
             .map(|token| token.secret().to_owned()),
-        access_token_expires_at: access_token_expiry(token_response.expires_in()),
+        access_token_expires_at,
         identity,
     };
 
