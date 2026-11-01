@@ -531,3 +531,70 @@ async fn confidential_client_exchange_uses_client_secret_basic_only() {
         "client secret must never be sent in the token request form body",
     );
 }
+
+#[tokio::test]
+async fn mismatched_userinfo_subject_fails_closed() {
+    let signing_key = EphemeralEs256Key::generate();
+    let nonce = Nonce::new_random();
+    let code = runtime_secret();
+    let (_, verifier) = PkceCodeChallenge::new_random_sha256();
+    let client_secret = runtime_secret();
+
+    let provider = spawn_mock_oidc_provider(
+        signing_key.jwks_json(),
+        None,
+        &signing_key,
+        nonce.secret(),
+        code.clone(),
+        verifier.secret().to_owned(),
+        client_secret.clone(),
+    )
+    .await;
+
+    // ID token keeps its original subject, but UserInfo returns
+    // a deliberately different identity.
+    *provider
+        .userinfo_subject
+        .lock()
+        .expect("mock UserInfo subject must be lockable") =
+        format!("{}-different", provider.subject);
+
+    let state = test_state_for_issuer(&provider.issuer, client_secret);
+    let state_key = runtime_secret();
+    let binding = runtime_secret();
+
+    insert_transaction_with(
+        &state,
+        &state_key,
+        &binding,
+        verifier,
+        nonce,
+        Instant::now(),
+    );
+
+    let params = HashMap::from([
+        ("code".to_owned(), code),
+        ("state".to_owned(), state_key.clone()),
+    ]);
+
+    let preauth_name = preauth_cookie_name(&state_key);
+    let jar = request_cookie_jar(&[(&preauth_name, &binding)]);
+
+    let (returned_jar, status) = callback(State(state.clone()), Query(params), jar)
+        .await
+        .expect_err("mismatched UserInfo subject must fail");
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(provider.token_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.userinfo_calls.load(Ordering::SeqCst), 1);
+
+    assert!(
+        returned_jar
+            .get(session_cookie_name(state.config.secure_cookie()))
+            .is_none(),
+        "mismatched subject must not issue an authenticated cookie",
+    );
+
+    let response = (returned_jar, status).into_response();
+    assert!(response_removes_cookie(&response, &preauth_name));
+}

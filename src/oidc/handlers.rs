@@ -9,13 +9,13 @@ use axum_extra::extract::cookie::CookieJar;
 use axum_governor::extractor::KeyExtractor;
 use openidconnect::{
     AuthorizationCode, ClientId, CsrfToken, Nonce, OAuth2TokenResponse, PkceCodeChallenge, Scope,
-    TokenResponse,
-    core::{CoreAuthenticationFlow, CoreClient},
+    TokenResponse, UserInfoError,
+    core::{CoreAuthenticationFlow, CoreClient, CoreUserInfoClaims},
 };
 
 use crate::session::{
-    AuthenticatedSession, access_token_expiry, build_session_cookie, new_session_id,
-    session_cookie_name,
+    AuthenticatedSession, SessionIdentity, access_token_expiry, build_session_cookie,
+    new_session_id, session_cookie_name,
 };
 
 use super::{
@@ -99,7 +99,6 @@ pub(super) async fn login(
             CsrfToken::new_random,
             Nonce::new_random,
         )
-        .add_scope(Scope::new("openid".to_owned()))
         .add_scope(Scope::new("email".to_owned()))
         .set_pkce_challenge(pkce_challenge)
         .url();
@@ -177,6 +176,7 @@ pub(super) async fn callback(
         Some(cookie) => cookie.value().to_owned(),
         None => return Err((jar, StatusCode::BAD_REQUEST)),
     };
+
     let presented_binding_hash = hash_browser_binding(&browser_binding_secret);
 
     let transaction =
@@ -196,55 +196,105 @@ pub(super) async fn callback(
         None => return Err((jar, StatusCode::BAD_REQUEST)),
     };
 
-    let provider_metadata = match provider_metadata(&state).await {
+    let initial_provider_metadata = match provider_metadata(&state).await {
         Ok(metadata) => metadata,
         Err(status) => return Err((jar, status)),
     };
 
     let client = CoreClient::from_provider_metadata(
-        provider_metadata.clone(),
+        initial_provider_metadata.clone(),
         ClientId::new(state.config.client_id.clone()),
         Some(state.config.client_secret.clone()),
     )
     .set_redirect_uri(state.config.redirect_uri.clone());
 
     let token_response = match client.exchange_code(AuthorizationCode::new(code)) {
-        Ok(exchange) => match exchange
-            .set_pkce_verifier(transaction.pkce_verifier)
-            .request_async(&state.http_client)
-            .await
-        {
-            Ok(response) => response,
-            Err(_) => return Err((jar, StatusCode::BAD_GATEWAY)),
-        },
+        Ok(exchange) => {
+            match exchange
+                .set_pkce_verifier(transaction.pkce_verifier)
+                .request_async(&state.http_client)
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => return Err((jar, StatusCode::BAD_GATEWAY)),
+            }
+        }
         Err(_) => return Err((jar, StatusCode::BAD_GATEWAY)),
     };
+
+    let access_token_expires_at = access_token_expiry(token_response.expires_in());
 
     let id_token = match token_response.id_token() {
         Some(id_token) => id_token,
         None => return Err((jar, StatusCode::UNAUTHORIZED)),
     };
 
-    let verification = verify_id_token_with_single_refresh(
+    let subject = match verify_id_token_with_single_refresh(
         &state.config,
-        provider_metadata,
+        initial_provider_metadata,
         id_token,
         &transaction.nonce,
         || refresh_provider_metadata(&state),
     )
-    .await;
+    .await
+    {
+        Ok(subject) => subject,
+        Err(status) => return Err((jar, status)),
+    };
 
-    if let Err(status) = verification {
-        return Err((jar, status));
-    }
+    let user_info_metadata = match provider_metadata(&state).await {
+        Ok(metadata) => metadata,
+        Err(status) => return Err((jar, status)),
+    };
+
+    let user_info_client = CoreClient::from_provider_metadata(
+        user_info_metadata,
+        ClientId::new(state.config.client_id.clone()),
+        Some(state.config.client_secret.clone()),
+    )
+    .set_redirect_uri(state.config.redirect_uri.clone());
+
+    let user_info_request = match user_info_client.user_info(
+        token_response.access_token().to_owned(),
+        Some(subject.clone()),
+    ) {
+        Ok(request) => request,
+        Err(_) => return Err((jar, StatusCode::BAD_GATEWAY)),
+    };
+
+    let user_info: CoreUserInfoClaims =
+        match user_info_request.request_async(&state.http_client).await {
+            Ok(claims) => claims,
+            Err(UserInfoError::ClaimsVerification(_)) => {
+                return Err((jar, StatusCode::UNAUTHORIZED));
+            }
+            Err(_) => return Err((jar, StatusCode::BAD_GATEWAY)),
+        };
+
+    let email = user_info.email().map(|email| email.as_str().to_owned());
+
+    let email_verified = if email.is_some() {
+        user_info.email_verified()
+    } else {
+        None
+    };
+
+    let identity = SessionIdentity {
+        issuer: state.config.issuer.to_string(),
+        subject: subject.as_str().to_owned(),
+        email,
+        email_verified,
+    };
 
     let authenticated_session = AuthenticatedSession {
         access_token: token_response.access_token().secret().to_owned(),
         refresh_token: token_response
             .refresh_token()
             .map(|token| token.secret().to_owned()),
-        access_token_expires_at: access_token_expiry(token_response.expires_in()),
+        access_token_expires_at,
+        identity,
     };
+
     let session_id = new_session_id();
 
     if state

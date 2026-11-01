@@ -197,22 +197,29 @@ async fn independent_authorization_transactions_keep_independent_bindings() {
 // AC-OIDC-TXN-006
 #[tokio::test]
 async fn concurrent_callbacks_for_same_transaction_reach_token_endpoint_at_most_once() {
-    let state = test_state();
     let signing_key = EphemeralEs256Key::generate();
     let nonce = Nonce::new_random();
     let code = runtime_secret();
     let (_, verifier) = PkceCodeChallenge::new_random_sha256();
     let verifier_value = verifier.secret().to_owned();
-    let token_endpoint = spawn_mock_token_endpoint(
-        signing_key.compact_id_token(nonce.secret()),
-        Some(code.clone()),
-        Some(verifier_value),
-        state.config.client_secret.secret().to_owned(),
+    let client_secret = runtime_secret();
+
+    let provider = spawn_mock_oidc_provider(
+        signing_key.jwks_json(),
+        None,
+        &signing_key,
+        nonce.secret(),
+        code.clone(),
+        verifier_value,
+        client_secret.clone(),
     )
     .await;
-    install_mock_provider_metadata(&state, &signing_key, &token_endpoint.url).await;
+
+    let state = test_state_for_issuer(&provider.issuer, client_secret);
+
     let state_key = runtime_secret();
     let binding = runtime_secret();
+
     insert_transaction_with(
         &state,
         &state_key,
@@ -221,10 +228,12 @@ async fn concurrent_callbacks_for_same_transaction_reach_token_endpoint_at_most_
         nonce,
         Instant::now(),
     );
+
     let params = HashMap::from([
         ("code".to_owned(), code),
         ("state".to_owned(), state_key.clone()),
     ]);
+
     let cookie_name = preauth_cookie_name(&state_key);
     let jar = request_cookie_jar(&[(&cookie_name, &binding)]);
     let barrier = Arc::new(Barrier::new(2));
@@ -234,16 +243,19 @@ async fn concurrent_callbacks_for_same_transaction_reach_token_endpoint_at_most_
         let state = state.clone();
         let params = params.clone();
         let jar = jar.clone();
+
         async move {
             barrier.wait().await;
             callback(State(state), Query(params), jar).await
         }
     };
+
     let second = {
         let barrier = barrier.clone();
         let state = state.clone();
         let params = params.clone();
         let jar = jar.clone();
+
         async move {
             barrier.wait().await;
             callback(State(state), Query(params), jar).await
@@ -251,13 +263,15 @@ async fn concurrent_callbacks_for_same_transaction_reach_token_endpoint_at_most_
     };
 
     let (first_result, second_result) = tokio::join!(first, second);
+
     let successes = [first_result.is_ok(), second_result.is_ok()]
         .into_iter()
         .filter(|succeeded| *succeeded)
         .count();
 
     assert_eq!(successes, 1);
-    assert_eq!(token_endpoint.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.token_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.userinfo_calls.load(Ordering::SeqCst), 1);
 }
 // AC-OIDC-TXN-007
 #[tokio::test]
