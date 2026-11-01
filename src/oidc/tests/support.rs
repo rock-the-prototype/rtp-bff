@@ -645,7 +645,6 @@ struct MockProviderState {
     jwks: Arc<Mutex<String>>,
     rotate_jwks_on_token: Option<String>,
     id_token: String,
-    subject: String,
     access_token: String,
     refresh_token: String,
     expected_code: String,
@@ -657,6 +656,7 @@ struct MockProviderState {
     userinfo_calls: Arc<AtomicUsize>,
     client_auth_failures: Arc<AtomicUsize>,
     client_secret_body_violations: Arc<AtomicUsize>,
+    userinfo_subject: Arc<Mutex<String>>,
 }
 
 pub(super) struct MockOidcProvider {
@@ -669,6 +669,8 @@ pub(super) struct MockOidcProvider {
     pub(super) client_secret_body_violations: Arc<AtomicUsize>,
     pub(super) access_token: String,
     pub(super) refresh_token: String,
+    pub(super) subject: String,
+    pub(super) userinfo_subject: Arc<Mutex<String>>,
 }
 
 async fn mock_discovery(State(state): State<MockProviderState>) -> impl IntoResponse {
@@ -788,9 +790,15 @@ async fn mock_userinfo(
             .into_response();
     }
 
+    let subject = state
+        .userinfo_subject
+        .lock()
+        .expect("mock UserInfo subject must be lockable")
+        .clone();
+
     let response = format!(
         r#"{{"sub":"{}","email":"member@example.test","email_verified":true}}"#,
-        state.subject
+        subject
     );
 
     (
@@ -818,6 +826,7 @@ pub(super) async fn spawn_mock_oidc_provider(
         .expect("mock OIDC provider must have an address");
     let issuer = format!("http://{address}");
     let subject = runtime_secret();
+    let userinfo_subject = Arc::new(Mutex::new(subject.clone()));
     let id_token = token_signing_key.compact_id_token_for_issuer(nonce, &issuer, &subject);
     let discovery_calls = Arc::new(AtomicUsize::new(0));
     let jwks_calls = Arc::new(AtomicUsize::new(0));
@@ -833,7 +842,6 @@ pub(super) async fn spawn_mock_oidc_provider(
         jwks: Arc::new(Mutex::new(initial_jwks)),
         rotate_jwks_on_token,
         id_token,
-        subject: subject.clone(),
         access_token: access_token.clone(),
         refresh_token: refresh_token.clone(),
         expected_code,
@@ -845,6 +853,7 @@ pub(super) async fn spawn_mock_oidc_provider(
         userinfo_calls: userinfo_calls.clone(),
         client_auth_failures: client_auth_failures.clone(),
         client_secret_body_violations: client_secret_body_violations.clone(),
+        userinfo_subject: userinfo_subject.clone(),
     };
 
     let app = Router::new()
@@ -870,6 +879,8 @@ pub(super) async fn spawn_mock_oidc_provider(
         client_secret_body_violations,
         access_token,
         refresh_token,
+        subject,
+        userinfo_subject,
     }
 }
 
